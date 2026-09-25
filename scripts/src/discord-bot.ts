@@ -691,6 +691,11 @@ function buildWhisperCardEmbed(mode: WhisperMode) {
     .setTimestamp();
 }
 
+function buildWhisperCardContent(recipientId: string, expiresAt: Date) {
+  const expiryTimestamp = Math.floor(expiresAt.getTime() / 1000);
+  return `<@${recipientId}>\n⏳ تنتهي الهمسة <t:${expiryTimestamp}:R>`;
+}
+
 function buildWhisperOpenButton(whisperId: string) {
   return new ActionRowBuilder<ButtonBuilder>().addComponents(
     new ButtonBuilder()
@@ -705,7 +710,7 @@ function buildPrivateWhisperEmbed(whisper: WhisperMessageRow) {
   const embed = new EmbedBuilder()
     .setColor(whisper.anonymous ? 0x252a34 : 0x7658d6)
     .setTitle(whisper.anonymous ? "🕵️ همسة مجهولة" : "💬 همسة خاصة")
-    .setDescription(whisper.body)
+    .setDescription(`**${whisper.body}**`)
     .setTimestamp(whisper.created_at);
 
   if (!whisper.anonymous && whisper.sender_name) {
@@ -1054,6 +1059,23 @@ async function handleWhisperButton(
     const expiryTimestamp = Math.floor(
       (openedWhisper.opened_at.getTime() + 24 * 60 * 60 * 1000) / 1000,
     );
+    try {
+      await interaction.message.edit({
+        content: buildWhisperCardContent(
+          openedWhisper.recipient_id,
+          new Date(expiryTimestamp * 1000),
+        ),
+        embeds: [buildWhisperCardEmbed(openedWhisper.anonymous ? "anonymous" : "identified")],
+        components: [buildWhisperOpenButton(openedWhisper.whisper_id)],
+        allowedMentions: { parse: [] },
+      });
+    } catch (error) {
+      writeLog("warn", "whisper_card_countdown_update_failed", {
+        channelId: whisperChannelId,
+        ...safeErrorDetails(error),
+      });
+    }
+
     await interaction.editReply({
       content: `محتوى الهمسة الخاصة بك:\n⏳ تُحذف تلقائياً <t:${expiryTimestamp}:R>.`,
       embeds: [buildPrivateWhisperEmbed(openedWhisper)],
@@ -1140,10 +1162,11 @@ async function handleWhisperSubmit(
 
   let cardMessage: Message | null = null;
   try {
-    await pool.query(
+    const insertedWhisper = await pool.query<{ created_at: Date }>(
       `INSERT INTO discord_whisper_messages
          (whisper_id, channel_id, recipient_id, sender_name, body, anonymous)
-       VALUES ($1, $2, $3, $4, $5, $6)`,
+       VALUES ($1, $2, $3, $4, $5, $6)
+       RETURNING created_at`,
       [
         whisperId,
         whisperChannelId,
@@ -1153,8 +1176,14 @@ async function handleWhisperSubmit(
         mode === "anonymous",
       ],
     );
+    const createdAt = insertedWhisper.rows[0]?.created_at;
+    if (!createdAt) throw new Error("The whisper creation time was not returned.");
+
     cardMessage = await channel.send({
-      content: `<@${recipientId}>`,
+      content: buildWhisperCardContent(
+        recipientId,
+        new Date(createdAt.getTime() + 48 * 60 * 60 * 1000),
+      ),
       embeds: [buildWhisperCardEmbed(mode)],
       components: [buildWhisperOpenButton(whisperId)],
       allowedMentions: { parse: [], users: [recipientId] },
