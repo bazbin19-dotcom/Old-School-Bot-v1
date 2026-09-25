@@ -1,15 +1,16 @@
-# [Project name]
+# Discord Image Bot
 
-_Replace the heading above with the project's name, and this line with one sentence describing what this app does for users._
+A Discord bot that converts images posted in one configured channel into interactive image posts with likes, comment threads, and author/moderator controls.
 
 ## Run & Operate
 
 - `pnpm --filter @workspace/api-server run dev` — run the API server (port 5000)
+- `pnpm --filter @workspace/scripts run discord-bot` — run the Discord image bot
 - `pnpm run typecheck` — full typecheck across all packages
 - `pnpm run build` — typecheck + build all packages
 - `pnpm --filter @workspace/api-spec run codegen` — regenerate API hooks and Zod schemas from the OpenAPI spec
 - `pnpm --filter @workspace/db run push` — push DB schema changes (dev only)
-- Required env: `DATABASE_URL` — Postgres connection string
+- Required env: `DATABASE_URL`, `DISCORD_CHANNEL_ID`, `DISCORD_BOT_TOKEN` (secret)
 
 ## Stack
 
@@ -22,15 +23,18 @@ _Replace the heading above with the project's name, and this line with one sente
 
 ## Where things live
 
-_Populate as you build — short repo map plus pointers to the source-of-truth file for DB schema, API contracts, theme files, etc._
+- `scripts/src/discord-bot.ts` — Discord events, image conversion, buttons, and modals
+- `lib/db/` — PostgreSQL connection used for persistent post and like state
 
 ## Architecture decisions
 
-_Populate as you build — non-obvious choices a reader couldn't infer from the code (3-5 bullets)._
+- Source messages are deleted only after the replacement post and database record are successfully created.
+- Likes and post controls persist in PostgreSQL; comments are stored in Discord threads attached to the post.
+- Captions and the divider are embed content; Discord renders buttons below the embed, not inside it.
 
 ## Product
 
-_Describe the high-level user-facing capabilities of this app once they exist._
+Images in the configured channel become embeds with an optional caption, subtle divider, persistent Like count, comment threads, and owner/moderator controls.
 
 ## User preferences
 
