@@ -29,6 +29,7 @@ function requireEnvironmentValue(name: string) {
 const token = requireEnvironmentValue("DISCORD_BOT_TOKEN");
 const channelId = requireEnvironmentValue("DISCORD_CHANNEL_ID");
 const databaseUrl = requireEnvironmentValue("DATABASE_URL");
+const retrySourceMessageId = process.env.DISCORD_RETRY_SOURCE_MESSAGE_ID;
 const maxUploadBytes = 8 * 1024 * 1024;
 const maxCaptionLength = 2_000;
 const separator = "────────────────────────────────";
@@ -142,7 +143,7 @@ async function getPost(messageId: string): Promise<ImagePost | null> {
     `SELECT message_id, source_message_id, channel_id, author_id, author_name,
             author_avatar_url, caption, images, comments_locked, thread_id
      FROM discord_image_posts
-     WHERE message_id = $1`,
+     WHERE message_id = $1 OR source_message_id = $1`,
     [messageId],
   );
   return result.rows[0] ? normalizePost(result.rows[0]) : null;
@@ -607,15 +608,29 @@ async function handleImageMessage(message: Message) {
     return;
   }
 
-  const alreadyConverted = await pool.query(
-    `SELECT 1 FROM discord_image_posts WHERE source_message_id = $1`,
-    [message.id],
-  );
-  if ((alreadyConverted.rowCount ?? 0) > 0) return;
+  const existingPost = await getPost(message.id);
+  if (existingPost) {
+    const replacement = await message.channel.messages.fetch(existingPost.message_id);
+    const likeCount = await getLikeCount(existingPost.message_id);
+    await replacement.edit({
+      components: buildButtons(
+        existingPost.message_id,
+        likeCount,
+        existingPost.comments_locked,
+      ),
+    });
+    await message.delete();
+    writeLog("info", "image_post_recovered", {
+      channelId,
+      postMessageId: existingPost.message_id,
+      sourceMessageId: message.id,
+    });
+    return;
+  }
 
   let sentMessage: Message | null = null;
   let postSaved = false;
-  let conversionComplete = false;
+  let stage = "download_images";
 
   try {
     const downloadedImages = await Promise.all(
@@ -636,17 +651,14 @@ async function handleImageMessage(message: Message) {
       })),
     );
 
+    stage = "send_embed";
     sentMessage = await message.channel.send({
       embeds: initialEmbeds,
       files: downloadedImages.map((image) => image.attachment),
       allowedMentions: { parse: [] },
     });
-    const sentWithAttachments = await sentMessage.fetch();
+    stage = "save_post";
     const storedImageNames = downloadedImages.map(({ fileName }) => fileName);
-    const allAttachmentsSent = storedImageNames.every((fileName) =>
-      sentWithAttachments.attachments.some((attachment) => attachment.name === fileName),
-    );
-    if (!allAttachmentsSent) throw new Error("Uploaded image attachment is missing.");
 
     await pool.query(
       `INSERT INTO discord_image_posts
@@ -666,11 +678,13 @@ async function handleImageMessage(message: Message) {
     );
     postSaved = true;
 
+    stage = "add_buttons";
     await sentMessage.edit({
       components: buildButtons(sentMessage.id, 0, false),
     });
+
+    stage = "delete_original";
     await message.delete();
-    conversionComplete = true;
     writeLog("info", "image_post_created", {
       channelId,
       postMessageId: sentMessage.id,
@@ -678,25 +692,74 @@ async function handleImageMessage(message: Message) {
       imageCount: downloadedImages.length,
     });
   } catch (error) {
-    if (sentMessage && !conversionComplete) {
-      await sentMessage.delete().catch(() => null);
-    }
-    if (postSaved && !conversionComplete) {
-      await pool
-        .query(`DELETE FROM discord_image_posts WHERE message_id = $1`, [sentMessage?.id])
+    if (sentMessage && postSaved && stage === "add_buttons") {
+      const likeCount = await getLikeCount(sentMessage.id).catch(() => 0);
+      await sentMessage
+        .edit({ components: buildButtons(sentMessage.id, likeCount, false) })
         .catch(() => null);
     }
 
     if (error instanceof UserFacingError) {
+      writeLog("warn", "image_post_not_completed", {
+        channelId,
+        sourceMessageId: message.id,
+        stage,
+      });
       await sendMessageNotice(message, error.userMessage);
     } else {
       writeLog("error", "image_post_failed", {
         channelId,
         sourceMessageId: message.id,
+        stage,
+        postMessageId: sentMessage?.id ?? "none",
+        postSaved,
         ...safeErrorDetails(error),
       });
+      await sendMessageNotice(
+        message,
+        sentMessage
+          ? "أنشأت نسخة الـEmbed لكن لم يكتمل التحويل؛ أبقيت الرسالة الأصلية ولم أحذف نسخة الـEmbed."
+          : "تعذر تحويل الصورة؛ أبقيت الرسالة الأصلية كما هي.",
+      );
     }
   }
+}
+
+async function retryConfiguredSourceMessage() {
+  if (!retrySourceMessageId) return;
+  writeLog("info", "retry_attempt_started", {
+    channelId,
+    sourceMessageId: retrySourceMessageId,
+  });
+  const channel = await client.channels.fetch(channelId);
+  if (!channel || channel.type !== ChannelType.GuildText) {
+    writeLog("error", "retry_channel_unavailable", { channelId });
+    return;
+  }
+
+  const sourceMessage = await channel.messages
+    .fetch(retrySourceMessageId)
+    .catch(() => null);
+  if (!sourceMessage) {
+    writeLog("warn", "retry_source_message_unavailable", {
+      channelId,
+      sourceMessageId: retrySourceMessageId,
+    });
+    return;
+  }
+
+  await handleImageMessage(sourceMessage);
+  const post = await getPost(retrySourceMessageId);
+  const remainingSource = await channel.messages
+    .fetch(retrySourceMessageId)
+    .then(() => true)
+    .catch(() => false);
+  writeLog("info", "retry_attempt_finished", {
+    channelId,
+    sourceMessageId: retrySourceMessageId,
+    postFound: Boolean(post),
+    sourceMessageRemains: remainingSource,
+  });
 }
 
 async function validateConfiguredChannel() {
@@ -774,9 +837,16 @@ client.once(Events.ClientReady, (readyClient) => {
   writeLog("info", "discord_bot_ready", {
     bot: readyClient.user.tag,
     channelId,
+    retryConfigured: Boolean(retrySourceMessageId),
   });
   void validateConfiguredChannel().catch((error: unknown) => {
     writeLog("error", "channel_validation_failed", safeErrorDetails(error));
+  });
+  void retryConfiguredSourceMessage().catch((error: unknown) => {
+    writeLog("error", "retry_source_failed", {
+      sourceMessageId: retrySourceMessageId ?? "none",
+      ...safeErrorDetails(error),
+    });
   });
 });
 
