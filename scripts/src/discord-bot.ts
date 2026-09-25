@@ -592,6 +592,39 @@ async function showSettings(interaction: ButtonInteraction, post: ImagePost) {
   });
 }
 
+async function notifyPostAuthorOfLike(
+  interaction: ButtonInteraction,
+  post: ImagePost,
+  message: Message,
+  images: Array<{ fileName: string; url: string }>,
+  likeCount: number,
+) {
+  try {
+    const author = await client.users.fetch(post.author_id);
+    const embed = new EmbedBuilder()
+      .setColor(0xe8798f)
+      .setTitle("إعجاب جديد على صورتك")
+      .setURL(message.url)
+      .setAuthor({
+        name: interaction.user.username,
+        iconURL: interaction.user.displayAvatarURL(),
+      })
+      .setDescription("أعجب هذا الشخص بالصورة التي نشرتها.")
+      .addFields({
+        name: "إجمالي الإعجابات",
+        value: String(likeCount),
+        inline: true,
+      })
+      .setFooter({ text: "اضغط على العنوان لفتح المنشور" })
+      .setTimestamp();
+
+    if (images[0]) embed.setImage(images[0].url);
+    await author.send({ embeds: [embed] });
+  } catch (error) {
+    writeLog("warn", "like_notification_failed", safeErrorDetails(error));
+  }
+}
+
 async function toggleLike(interaction: ButtonInteraction, post: ImagePost) {
   const alreadyLiked = await userHasLiked(post.message_id, interaction.user.id);
   if (alreadyLiked && interaction.component.style !== ButtonStyle.Danger) {
@@ -619,13 +652,15 @@ async function toggleLike(interaction: ButtonInteraction, post: ImagePost) {
      WHERE message_id = $1 AND user_id = $2`,
     [post.message_id, interaction.user.id],
   );
+  let newLike = false;
   if ((deleted.rowCount ?? 0) === 0) {
-    await pool.query(
+    const inserted = await pool.query(
       `INSERT INTO discord_image_post_likes (message_id, user_id)
        VALUES ($1, $2)
        ON CONFLICT (message_id, user_id) DO NOTHING`,
       [post.message_id, interaction.user.id],
     );
+    newLike = (inserted.rowCount ?? 0) > 0;
   }
 
   const likeCount = await getLikeCount(post.message_id);
@@ -638,6 +673,9 @@ async function toggleLike(interaction: ButtonInteraction, post: ImagePost) {
     likeCount,
     post.comments_locked,
   );
+  if (newLike) {
+    await notifyPostAuthorOfLike(interaction, post, message, images, likeCount);
+  }
 }
 
 async function handleButton(interaction: ButtonInteraction) {
