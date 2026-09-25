@@ -245,7 +245,7 @@ async function updateMemberDailyRole(message: Message, pool: Pool) {
        DO UPDATE SET
          streak_days = CASE
            WHEN discord_daily_post_streaks.last_post_date = EXCLUDED.last_post_date
-             THEN discord_daily_post_streaks.streak_days
+             THEN GREATEST(discord_daily_post_streaks.streak_days, 1)
            WHEN discord_daily_post_streaks.last_post_date = EXCLUDED.last_post_date - 1
              THEN discord_daily_post_streaks.streak_days + 1
            WHEN discord_daily_post_streaks.last_post_date < EXCLUDED.last_post_date
@@ -446,6 +446,67 @@ async function removeMissedDayRoles(client: Client, pool: Pool) {
   }
 }
 
+async function validateDailyRewardAccess(client: Client) {
+  const channels = await Promise.all(
+    [...rewardChannelIds].map(async (channelId) => {
+      try {
+        const channel = await client.channels.fetch(channelId);
+        const guildId =
+          channel &&
+          "guildId" in channel &&
+          typeof channel.guildId === "string"
+            ? channel.guildId
+            : null;
+        return { channelId, guildId };
+      } catch (error) {
+        logRoleFailure("daily_post_reward_channel_check_failed", error, {
+          channelId,
+        });
+        return { channelId, guildId: null };
+      }
+    }),
+  );
+
+  const guildIds = new Set<string>();
+  for (const channel of channels) {
+    if (channel.guildId) {
+      guildIds.add(channel.guildId);
+    } else {
+      console.error(
+        JSON.stringify({
+          level: "error",
+          event: "daily_post_reward_channel_unavailable",
+          timestamp: new Date().toISOString(),
+          channelId: channel.channelId,
+        }),
+      );
+    }
+  }
+
+  for (const guildId of guildIds) {
+    try {
+      const guild =
+        client.guilds.cache.get(guildId) ?? (await client.guilds.fetch(guildId));
+      await getBotMemberWithRolePermission(guild);
+      console.log(
+        JSON.stringify({
+          level: "info",
+          event: "daily_post_reward_permissions_ready",
+          timestamp: new Date().toISOString(),
+          guildId,
+          channelCount: channels.filter(
+            (channel) => channel.guildId === guildId,
+          ).length,
+        }),
+      );
+    } catch (error) {
+      logRoleFailure("daily_post_reward_permission_check_failed", error, {
+        guildId,
+      });
+    }
+  }
+}
+
 export async function initializeDailyPostRewardTables(pool: Pool) {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS discord_daily_post_streaks (
@@ -494,6 +555,7 @@ export function attachDailyPostRewards(client: Client, pool: Pool) {
 
   const onReady = () => {
     if (cleanupTimer) return;
+    void validateDailyRewardAccess(client);
     void removeMissedDayRoles(client, pool);
     cleanupTimer = setInterval(
       () => void removeMissedDayRoles(client, pool),
