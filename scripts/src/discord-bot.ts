@@ -316,8 +316,11 @@ async function fetchPostMessage(post: ImagePost) {
   }
   const message = await channel.messages.fetch(post.message_id);
   const mediaGalleryUrls = getMediaGalleryUrls(message.components);
+  const availableAttachments = [...message.attachments.values()];
   const images = post.images.map((fileName, index) => {
-    const attachment = message.attachments.find((item) => item.name === fileName);
+    const attachment =
+      message.attachments.find((item) => item.name === fileName) ??
+      availableAttachments[index];
     const recoveredUrl =
       mediaGalleryUrls[index] ?? message.embeds[index]?.image?.url;
     const url =
@@ -883,14 +886,26 @@ async function handleImageMessage(message: Message) {
       allowedMentions: { parse: [] },
     });
     sentMessage = createdMessage;
-    postImages = postImages.map(({ fileName }) => {
-      const attachment = createdMessage.attachments.find(
-        (item) => item.name === fileName,
-      );
-      if (!attachment) {
-        throw new Error("An uploaded image attachment could not be found.");
+    let uploadedAttachments = [...createdMessage.attachments.values()];
+    let messageWithUploads = createdMessage;
+    if (uploadedAttachments.length < postImages.length) {
+      messageWithUploads = await message.channel.messages.fetch(createdMessage.id);
+      sentMessage = messageWithUploads;
+      uploadedAttachments = [...messageWithUploads.attachments.values()];
+    }
+    const uploadedGalleryUrls = getMediaGalleryUrls(messageWithUploads.components);
+    postImages = postImages.map(({ fileName }, index) => {
+      const attachment =
+        uploadedAttachments.find((item) => item.name === fileName) ??
+        uploadedAttachments[index];
+      const galleryUrl = uploadedGalleryUrls[index];
+      const url =
+        attachment?.url ??
+        (galleryUrl && !galleryUrl.startsWith("attachment://") ? galleryUrl : null);
+      if (!url) {
+        throw new Error("Discord did not return a usable URL for an uploaded image.");
       }
-      return { fileName, url: attachment.url };
+      return { fileName: attachment?.name ?? fileName, url };
     });
     stage = "save_post";
     const storedImageNames = postImages.map(({ fileName }) => fileName);
@@ -936,6 +951,14 @@ async function handleImageMessage(message: Message) {
         likeCount,
         false,
       ).catch(() => null);
+    }
+    if (sentMessage && !postSaved) {
+      await sentMessage.delete().catch((cleanupError: unknown) => {
+        writeLog("warn", "incomplete_post_card_cleanup_failed", {
+          channelId,
+          ...safeErrorDetails(cleanupError),
+        });
+      });
     }
 
     if (error instanceof UserFacingError) {
