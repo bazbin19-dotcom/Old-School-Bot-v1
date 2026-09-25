@@ -957,7 +957,7 @@ async function handleImageMessage(message: Message) {
       await sendMessageNotice(
         message,
         sentMessage
-          ? "أنشأت نسخة الـEmbed لكن لم يكتمل التحويل؛ أبقيت الرسالة الأصلية ولم أحذف نسخة الـEmbed."
+          ? "أنشأت بطاقة الصورة لكن لم تكتمل إضافة الأزرار؛ أبقيت الرسالة الأصلية ولم أحذفها."
           : "تعذر تحويل الصورة؛ أبقيت الرسالة الأصلية كما هي.",
       );
     }
@@ -999,6 +999,35 @@ async function retryConfiguredSourceMessage() {
     postFound: Boolean(post),
     sourceMessageRemains: remainingSource,
   });
+}
+
+async function recoverPendingImagePosts() {
+  const pendingPosts = await pool.query<ImagePostRow>(
+    `SELECT message_id, source_message_id, channel_id, author_id, author_name,
+            author_avatar_url, caption, images, comments_locked, thread_id
+     FROM discord_image_posts
+     WHERE channel_id = $1
+       AND created_at >= now() - interval '1 day'
+     ORDER BY created_at DESC
+     LIMIT 25`,
+    [channelId],
+  );
+  const channel = await client.channels.fetch(channelId);
+  if (!channel || channel.type !== ChannelType.GuildText) return;
+
+  for (const row of pendingPosts.rows) {
+    const sourceMessage = await channel.messages
+      .fetch(row.source_message_id)
+      .catch(() => null);
+    if (!sourceMessage) continue;
+
+    writeLog("info", "pending_image_post_recovery_started", {
+      channelId,
+      postMessageId: row.message_id,
+      sourceMessageId: row.source_message_id,
+    });
+    await handleImageMessage(sourceMessage);
+  }
 }
 
 async function validateConfiguredChannel() {
@@ -1100,6 +1129,9 @@ client.once(Events.ClientReady, (readyClient) => {
       sourceMessageId: retrySourceMessageId ?? "none",
       ...safeErrorDetails(error),
     });
+  });
+  void recoverPendingImagePosts().catch((error: unknown) => {
+    writeLog("error", "pending_image_post_recovery_failed", safeErrorDetails(error));
   });
 });
 

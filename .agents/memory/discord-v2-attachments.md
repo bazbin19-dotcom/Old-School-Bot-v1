@@ -3,8 +3,8 @@ name: Discord V2 attachments
 description: Components V2 messages still depend on explicit attachment retention when editing.
 ---
 
-When editing an image post, include the IDs of its existing attachments in the edit payload. Omitting them can remove the files even if a media gallery still appears to render, causing later interaction handlers to fail when they fetch the post images.
+On the initial send, `attachment://filename` can reference files uploaded in that request. For later edits, use each retained attachment's direct `url` and include its `id` in the edit payload's `attachments` list. Reusing `attachment://filename` during an edit can fail validation even when the attachment is retained.
 
-**Why:** Like and comment handlers look up images by the stored filenames; dropped Discord attachments make those actions fail with a missing-image error.
+**Why:** Omitting attachment IDs can remove the files, while reusing `attachment://` during edits can make Discord reject the updated gallery. Both failures leave a post without usable controls or break later image lookups.
 
-**How to apply:** Any message edit that changes Components V2 layout or buttons should preserve current attachment IDs. For already-affected posts, recover an image URL from the media gallery when possible.
+**How to apply:** After uploading files, rebuild the post with the returned attachment URLs. On every edit, preserve existing attachment IDs. For already-affected posts, recover a direct URL from the media gallery when possible.
