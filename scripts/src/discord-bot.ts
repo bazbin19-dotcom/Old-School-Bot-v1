@@ -616,6 +616,15 @@ function buildWhisperPanelContainer() {
     .addActionRowComponents(buildWhisperPanelButtons());
 }
 
+function buildWhisperPanelPayload() {
+  return {
+    embeds: [],
+    components: [buildWhisperPanelContainer()],
+    flags: MessageFlags.IsComponentsV2 as const,
+    allowedMentions: { parse: [] as const },
+  };
+}
+
 function buildWhisperModeButtons() {
   return new ActionRowBuilder<ButtonBuilder>().addComponents(
     new ButtonBuilder()
@@ -1041,10 +1050,24 @@ async function handleWhisperSubmit(
     return;
   }
 
-  await interaction.editReply(
+  let panelMoved = false;
+  try {
+    panelMoved = await queueWhisperPanelMove(channel);
+  } catch (error) {
+    writeLog("warn", "whisper_panel_move_failed", {
+      channelId: whisperChannelId,
+      ...safeErrorDetails(error),
+    });
+  }
+
+  const successMessage =
     mode === "anonymous"
       ? `تم إرسال همستك المجهولة إلى ${recipient.displayName}.`
-      : `تم إرسال همستك إلى ${recipient.displayName}. سيظهر اسمك له فقط.`,
+      : `تم إرسال همستك إلى ${recipient.displayName}. سيظهر اسمك له فقط.`;
+  await interaction.editReply(
+    panelMoved
+      ? successMessage
+      : `${successMessage}\nتعذر نقل لوحة الإرسال إلى أسفل القناة؛ تحقق من صلاحيات البوت.`,
   );
 }
 
@@ -1749,12 +1772,7 @@ async function ensureWhisperPanel() {
     ? await channel.messages.fetch(previousMessageId).catch(() => null)
     : null;
 
-  const panelPayload = {
-    embeds: [],
-    components: [buildWhisperPanelContainer()],
-    flags: MessageFlags.IsComponentsV2 as const,
-    allowedMentions: { parse: [] as const },
-  };
+  const panelPayload = buildWhisperPanelPayload();
 
   if (previousPanel) {
     await previousPanel.edit(panelPayload);
@@ -1785,6 +1803,95 @@ async function ensureWhisperPanel() {
     messageId: newPanel.id,
     reused: false,
   });
+}
+
+let whisperPanelMoveQueue: Promise<void> = Promise.resolve();
+
+async function moveWhisperPanelToBottom(channel: TextChannel): Promise<boolean> {
+  const storedPanel = await pool.query<{ message_id: string }>(
+    `SELECT message_id
+     FROM discord_whisper_panels
+     WHERE channel_id = $1`,
+    [whisperChannelId],
+  );
+  const previousMessageId = storedPanel.rows[0]?.message_id;
+  const previousPanel = previousMessageId
+    ? await channel.messages.fetch(previousMessageId).catch(() => null)
+    : null;
+
+  const newPanel = await channel.send(buildWhisperPanelPayload());
+  try {
+    await pool.query(
+      `INSERT INTO discord_whisper_panels (channel_id, message_id)
+       VALUES ($1, $2)
+       ON CONFLICT (channel_id)
+       DO UPDATE SET message_id = EXCLUDED.message_id`,
+      [whisperChannelId, newPanel.id],
+    );
+  } catch (error) {
+    await newPanel.delete().catch((cleanupError: unknown) => {
+      writeLog("warn", "whisper_panel_replacement_cleanup_failed", {
+        channelId: whisperChannelId,
+        ...safeErrorDetails(cleanupError),
+      });
+    });
+    throw error;
+  }
+
+  if (previousPanel) {
+    try {
+      await previousPanel.delete();
+    } catch (error) {
+      let restoredPreviousPanel = false;
+      try {
+        await pool.query(
+          `UPDATE discord_whisper_panels
+           SET message_id = $2
+           WHERE channel_id = $1`,
+          [whisperChannelId, previousPanel.id],
+        );
+        restoredPreviousPanel = true;
+      } catch (restoreError) {
+        writeLog("error", "whisper_panel_reference_restore_failed", {
+          channelId: whisperChannelId,
+          ...safeErrorDetails(restoreError),
+        });
+      }
+
+      if (restoredPreviousPanel) {
+        await newPanel.delete().catch((cleanupError: unknown) => {
+          writeLog("warn", "whisper_panel_replacement_cleanup_failed", {
+            channelId: whisperChannelId,
+            ...safeErrorDetails(cleanupError),
+          });
+        });
+      }
+
+      writeLog("warn", "whisper_panel_old_message_delete_failed", {
+        channelId: whisperChannelId,
+        ...safeErrorDetails(error),
+      });
+      return false;
+    }
+  }
+
+  writeLog("info", "whisper_panel_moved_to_bottom", {
+    channelId: whisperChannelId,
+    messageId: newPanel.id,
+    replacedMessageId: previousMessageId ?? "none",
+  });
+  return true;
+}
+
+function queueWhisperPanelMove(channel: TextChannel): Promise<boolean> {
+  const currentMove = whisperPanelMoveQueue.then(() =>
+    moveWhisperPanelToBottom(channel),
+  );
+  whisperPanelMoveQueue = currentMove.then(
+    () => undefined,
+    () => undefined,
+  );
+  return currentMove;
 }
 
 client.on(Events.MessageCreate, (message) => {
