@@ -36,6 +36,7 @@ function requireEnvironmentValue(name: string) {
 
 const token = requireEnvironmentValue("DISCORD_BOT_TOKEN");
 const channelId = requireEnvironmentValue("DISCORD_CHANNEL_ID");
+const formattedMessageChannelId = "1546491155406135296";
 const databaseUrl = requireEnvironmentValue("DATABASE_URL");
 const retrySourceMessageId = process.env.DISCORD_RETRY_SOURCE_MESSAGE_ID;
 const maxUploadBytes = 8 * 1024 * 1024;
@@ -934,6 +935,22 @@ function hasRequiredChannelPermissions(channel: TextChannel) {
   ]);
 }
 
+function getFormattedMessageChannelMissingPermissions(channel: TextChannel) {
+  const requiredPermissions: Array<[bigint, string]> = [
+    [PermissionFlagsBits.ViewChannel, "View Channel"],
+    [PermissionFlagsBits.SendMessages, "Send Messages"],
+    [PermissionFlagsBits.EmbedLinks, "Embed Links"],
+    [PermissionFlagsBits.ManageMessages, "Manage Messages"],
+  ];
+  const member = channel.guild.members.me;
+  const permissions = member ? channel.permissionsFor(member) : null;
+  return permissions
+    ? requiredPermissions
+        .filter(([permission]) => !permissions.has(permission))
+        .map(([, name]) => name)
+    : requiredPermissions.map(([, name]) => name);
+}
+
 async function handleImageMessage(message: Message) {
   if (
     message.author.bot ||
@@ -1103,6 +1120,75 @@ async function handleImageMessage(message: Message) {
   }
 }
 
+async function handleFormattedTextMessage(message: Message) {
+  if (
+    message.author.bot ||
+    message.channelId !== formattedMessageChannelId ||
+    !message.inGuild() ||
+    message.channel.type !== ChannelType.GuildText ||
+    !message.content.trim()
+  ) {
+    return;
+  }
+
+  const channel = message.channel;
+  if (getFormattedMessageChannelMissingPermissions(channel).length > 0) return;
+
+  const authorName = message.member?.displayName ?? message.author.username;
+  const avatarUrl = message.author.displayAvatarURL({ extension: "png", size: 256 });
+  const embed = new EmbedBuilder()
+    .setColor(0xe8798f)
+    .setAuthor({ name: authorName, iconURL: avatarUrl })
+    .setDescription(message.content)
+    .setThumbnail(avatarUrl)
+    .setFooter({ text: "رسالة نصية" })
+    .setTimestamp(message.createdAt);
+
+  let replacementMessage: Message;
+  try {
+    replacementMessage = await channel.send({
+      embeds: [embed],
+      allowedMentions: { parse: [] },
+    });
+  } catch (error) {
+    writeLog("error", "formatted_message_send_failed", {
+      channelId: formattedMessageChannelId,
+      sourceMessageId: message.id,
+      ...safeErrorDetails(error),
+    });
+    return;
+  }
+
+  try {
+    await message.delete();
+    writeLog("info", "formatted_message_created", {
+      channelId: formattedMessageChannelId,
+      sourceMessageId: message.id,
+      replacementMessageId: replacementMessage.id,
+    });
+  } catch (error) {
+    const originalStillExists = await channel.messages
+      .fetch(message.id)
+      .then(() => true)
+      .catch(() => false);
+    if (originalStillExists) {
+      await replacementMessage.delete().catch((cleanupError: unknown) => {
+        writeLog("warn", "formatted_message_cleanup_failed", {
+          channelId: formattedMessageChannelId,
+          replacementMessageId: replacementMessage.id,
+          ...safeErrorDetails(cleanupError),
+        });
+      });
+    }
+    writeLog("error", "formatted_message_delete_failed", {
+      channelId: formattedMessageChannelId,
+      sourceMessageId: message.id,
+      replacementMessageId: replacementMessage.id,
+      ...safeErrorDetails(error),
+    });
+  }
+}
+
 async function retryConfiguredSourceMessage() {
   if (!retrySourceMessageId) return;
   writeLog("info", "retry_attempt_started", {
@@ -1218,9 +1304,39 @@ async function validateConfiguredChannel() {
   }
 }
 
+async function validateFormattedMessageChannel() {
+  const channel = await client.channels.fetch(formattedMessageChannelId);
+  if (!channel || channel.type !== ChannelType.GuildText) {
+    writeLog("error", "formatted_message_channel_unavailable", {
+      channelId: formattedMessageChannelId,
+    });
+    return;
+  }
+
+  const missingPermissions = getFormattedMessageChannelMissingPermissions(channel);
+  if (missingPermissions.length > 0) {
+    writeLog("warn", "formatted_message_channel_permissions_missing", {
+      channelId: formattedMessageChannelId,
+      permissions: missingPermissions.join(", "),
+    });
+  } else {
+    writeLog("info", "formatted_message_channel_ready", {
+      channelId: formattedMessageChannelId,
+    });
+  }
+}
+
 client.on(Events.MessageCreate, (message) => {
   void handleImageMessage(message).catch((error: unknown) => {
     writeLog("error", "message_handler_failed", {
+      ...safeErrorDetails(error),
+    });
+  });
+});
+
+client.on(Events.MessageCreate, (message) => {
+  void handleFormattedTextMessage(message).catch((error: unknown) => {
+    writeLog("error", "formatted_message_handler_failed", {
       ...safeErrorDetails(error),
     });
   });
@@ -1262,6 +1378,12 @@ client.once(Events.ClientReady, (readyClient) => {
   });
   void validateConfiguredChannel().catch((error: unknown) => {
     writeLog("error", "channel_validation_failed", safeErrorDetails(error));
+  });
+  void validateFormattedMessageChannel().catch((error: unknown) => {
+    writeLog("error", "formatted_message_channel_validation_failed", {
+      channelId: formattedMessageChannelId,
+      ...safeErrorDetails(error),
+    });
   });
   void retryConfiguredSourceMessage().catch((error: unknown) => {
     writeLog("error", "retry_source_failed", {
