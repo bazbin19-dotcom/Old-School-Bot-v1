@@ -579,25 +579,6 @@ function isWhisperMode(value: string | undefined): value is WhisperMode {
   return value === "anonymous" || value === "identified";
 }
 
-function buildWhisperPanelEmbed() {
-  return new EmbedBuilder()
-    .setColor(0x7658d6)
-    .setTitle("💬 قسم الهمسة")
-    .setDescription(
-      [
-        "أرسل رسالة خاصة إلى أي عضو في السيرفر.",
-        "",
-        "🕵️ **همسة مجهولة:** لا تظهر هوية المرسل للمستلم.",
-        "👤 **همسة معلومة:** يظهر اسم المرسل للمستلم فقط.",
-        "",
-        "محتوى الهمسة لا يظهر في القناة، ولا يستطيع فتحه إلا المستلم المحدد.",
-        "",
-        "━━━━━━━━━━━━━━━━━━━━",
-      ].join("\n"),
-    )
-    .setFooter({ text: "اضغط «إرسال همسة» للبدء." });
-}
-
 function buildWhisperPanelButtons() {
   return new ActionRowBuilder<ButtonBuilder>().addComponents(
     new ButtonBuilder()
@@ -606,6 +587,33 @@ function buildWhisperPanelButtons() {
       .setEmoji("✉️")
       .setStyle(ButtonStyle.Primary),
   );
+}
+
+function buildWhisperPanelContainer() {
+  return new ContainerBuilder()
+    .setAccentColor(0x7658d6)
+    .addTextDisplayComponents(
+      new TextDisplayBuilder().setContent(
+        [
+          "## 💬 قسم الهمسة",
+          "أرسل رسالة خاصة إلى أي عضو في السيرفر.",
+          "",
+          "🕵️ **همسة مجهولة:** لا تظهر هوية المرسل للمستلم.",
+          "👤 **همسة معلومة:** يظهر اسم المرسل للمستلم فقط.",
+          "",
+          "محتوى الهمسة لا يظهر في القناة، ولا يستطيع فتحه إلا المستلم المحدد.",
+        ].join("\n"),
+      ),
+    )
+    .addSeparatorComponents(
+      new SeparatorBuilder()
+        .setDivider(true)
+        .setSpacing(SeparatorSpacingSize.Small),
+    )
+    .addTextDisplayComponents(
+      new TextDisplayBuilder().setContent("اضغط «إرسال همسة» للبدء."),
+    )
+    .addActionRowComponents(buildWhisperPanelButtons());
 }
 
 function buildWhisperModeButtons() {
@@ -1742,8 +1750,9 @@ async function ensureWhisperPanel() {
     : null;
 
   const panelPayload = {
-    embeds: [buildWhisperPanelEmbed()],
-    components: [buildWhisperPanelButtons()],
+    embeds: [],
+    components: [buildWhisperPanelContainer()],
+    flags: MessageFlags.IsComponentsV2,
     allowedMentions: { parse: [] as const },
   };
 
