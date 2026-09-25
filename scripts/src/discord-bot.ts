@@ -29,6 +29,10 @@ import {
   type UserSelectMenuInteraction,
 } from "discord.js";
 import { Pool, type QueryResultRow } from "pg";
+import {
+  attachDailyPostRewards,
+  initializeDailyPostRewardTables,
+} from "./daily-post-rewards.js";
 
 function requireEnvironmentValue(name: string) {
   const value = process.env[name];
@@ -47,6 +51,7 @@ const maxCaptionLength = 2_000;
 const legacySeparator = "────────────────────────────────";
 
 const pool = new Pool({ connectionString: databaseUrl });
+let stopDailyPostRewards = () => {};
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
@@ -2152,6 +2157,7 @@ client.on(Events.Error, (error) => {
 
 async function shutdown(signal: string) {
   writeLog("info", "shutdown_started", { signal });
+  stopDailyPostRewards();
   if (whisperExpirationCleanupTimer) {
     clearInterval(whisperExpirationCleanupTimer);
     whisperExpirationCleanupTimer = undefined;
@@ -2166,11 +2172,14 @@ process.once("SIGTERM", () => void shutdown("SIGTERM"));
 
 async function main() {
   await initializeDatabase();
+  await initializeDailyPostRewardTables(pool);
+  stopDailyPostRewards = attachDailyPostRewards(client, pool);
   await client.login(token);
 }
 
 void main().catch(async (error: unknown) => {
   writeLog("error", "startup_failed", safeErrorDetails(error));
+  stopDailyPostRewards();
   client.destroy();
   await pool.end().catch(() => undefined);
   process.exitCode = 1;
