@@ -183,6 +183,18 @@ async function getLikeCount(messageId: string): Promise<number> {
   return Number(result.rows[0]?.count ?? 0);
 }
 
+async function userHasLiked(messageId: string, userId: string): Promise<boolean> {
+  const result = await pool.query<{ liked: boolean }>(
+    `SELECT EXISTS (
+       SELECT 1
+       FROM discord_image_post_likes
+       WHERE message_id = $1 AND user_id = $2
+     ) AS liked`,
+    [messageId, userId],
+  );
+  return result.rows[0]?.liked ?? false;
+}
+
 function buildPostContainer(
   post: Pick<ImagePost, "author_name" | "author_avatar_url" | "caption">,
   images: Array<{ fileName: string; url: string }>,
@@ -303,12 +315,52 @@ async function fetchPostMessage(post: ImagePost) {
     throw new Error("Configured post channel is unavailable.");
   }
   const message = await channel.messages.fetch(post.message_id);
-  const images = post.images.map((fileName) => {
+  const mediaGalleryUrls = getMediaGalleryUrls(message.components);
+  const images = post.images.map((fileName, index) => {
     const attachment = message.attachments.find((item) => item.name === fileName);
-    if (!attachment) throw new Error("A post image attachment could not be found.");
-    return { fileName, url: attachment.url };
+    const recoveredUrl =
+      mediaGalleryUrls[index] ?? message.embeds[index]?.image?.url;
+    const url =
+      attachment?.url ??
+      (recoveredUrl && !recoveredUrl.startsWith("attachment://")
+        ? recoveredUrl
+        : null);
+    if (!url) throw new Error("A post image attachment could not be found.");
+    return { fileName, url };
   });
   return { channel, message, images };
+}
+
+function getMediaGalleryUrls(components: readonly unknown[]): string[] {
+  const urls: string[] = [];
+
+  const visit = (component: unknown) => {
+    if (!component || typeof component !== "object") return;
+    const candidate = component as {
+      toJSON?: () => unknown;
+      type?: number;
+      components?: unknown[];
+      items?: Array<{ media?: { url?: string } }>;
+    };
+    const serialized =
+      typeof candidate.toJSON === "function" ? candidate.toJSON() : component;
+    if (!serialized || typeof serialized !== "object") return;
+
+    const data = serialized as {
+      type?: number;
+      components?: unknown[];
+      items?: Array<{ media?: { url?: string } }>;
+    };
+    if (data.type === 12 && Array.isArray(data.items)) {
+      for (const item of data.items) {
+        if (typeof item.media?.url === "string") urls.push(item.media.url);
+      }
+    }
+    if (Array.isArray(data.components)) data.components.forEach(visit);
+  };
+
+  components.forEach(visit);
+  return urls;
 }
 
 async function editPostCard(
@@ -319,10 +371,13 @@ async function editPostCard(
   likeCount: number,
   commentsLocked: boolean,
 ) {
+  const attachments = [...message.attachments.keys()].map((id) => ({ id }));
+
   if (!message.flags.has(MessageFlags.IsComponentsV2)) {
     await message.edit({
       embeds: buildLegacyEmbeds(post, images),
       components: [buildPostButtons(messageId, likeCount, commentsLocked)],
+      attachments,
     });
     return;
   }
@@ -332,6 +387,7 @@ async function editPostCard(
       buildPostContainer(post, images, messageId, likeCount, commentsLocked),
     ],
     flags: MessageFlags.IsComponentsV2,
+    attachments,
   });
 }
 
@@ -435,6 +491,27 @@ async function showSettings(interaction: ButtonInteraction, post: ImagePost) {
 }
 
 async function toggleLike(interaction: ButtonInteraction, post: ImagePost) {
+  const alreadyLiked = await userHasLiked(post.message_id, interaction.user.id);
+  if (alreadyLiked && interaction.component.style !== ButtonStyle.Danger) {
+    const [likeCount, { message, images }] = await Promise.all([
+      getLikeCount(post.message_id),
+      fetchPostMessage(post),
+    ]);
+    await editPostCard(
+      message,
+      post,
+      images,
+      post.message_id,
+      likeCount,
+      post.comments_locked,
+    );
+    await interaction.followUp({
+      content: "تمت مزامنة حالة الإعجاب. اضغط مرة أخرى إذا أردت إزالة إعجابك.",
+      ephemeral: true,
+    });
+    return;
+  }
+
   const deleted = await pool.query(
     `DELETE FROM discord_image_post_likes
      WHERE message_id = $1 AND user_id = $2`,
