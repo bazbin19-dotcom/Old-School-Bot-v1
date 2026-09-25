@@ -1752,7 +1752,7 @@ async function ensureWhisperPanel() {
   const panelPayload = {
     embeds: [],
     components: [buildWhisperPanelContainer()],
-    flags: MessageFlags.IsComponentsV2,
+    flags: MessageFlags.IsComponentsV2 as const,
     allowedMentions: { parse: [] as const },
   };
 
