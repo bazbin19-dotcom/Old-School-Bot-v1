@@ -5,11 +5,19 @@ import {
   ButtonStyle,
   ChannelType,
   Client,
+  ContainerBuilder,
   EmbedBuilder,
   Events,
   GatewayIntentBits,
   ModalBuilder,
+  MediaGalleryBuilder,
+  MessageFlags,
   PermissionFlagsBits,
+  SectionBuilder,
+  SeparatorBuilder,
+  SeparatorSpacingSize,
+  TextDisplayBuilder,
+  ThumbnailBuilder,
   TextChannel,
   TextInputBuilder,
   TextInputStyle,
@@ -32,7 +40,7 @@ const databaseUrl = requireEnvironmentValue("DATABASE_URL");
 const retrySourceMessageId = process.env.DISCORD_RETRY_SOURCE_MESSAGE_ID;
 const maxUploadBytes = 8 * 1024 * 1024;
 const maxCaptionLength = 2_000;
-const separator = "────────────────────────────────";
+const legacySeparator = "────────────────────────────────";
 
 const pool = new Pool({ connectionString: databaseUrl });
 const client = new Client({
@@ -159,33 +167,74 @@ async function getLikeCount(messageId: string): Promise<number> {
   return Number(result.rows[0]?.count ?? 0);
 }
 
-function buildButtons(
+function buildPostContainer(
+  post: Pick<ImagePost, "author_name" | "author_avatar_url" | "caption">,
+  images: Array<{ fileName: string; url: string }>,
+  messageId: string,
+  likeCount: number,
+  commentsLocked: boolean,
+  includeButtons = true,
+) {
+  const caption = post.caption.trim();
+  const header = new SectionBuilder().addTextDisplayComponents(
+    new TextDisplayBuilder().setContent(
+      caption ? `**${post.author_name}**\n${caption}` : `**${post.author_name}**`,
+    ),
+  );
+
+  if (post.author_avatar_url) {
+    header.setThumbnailAccessory(
+      new ThumbnailBuilder().setURL(post.author_avatar_url),
+    );
+  }
+
+  const container = new ContainerBuilder()
+    .addSectionComponents(header)
+    .addMediaGalleryComponents(
+      new MediaGalleryBuilder().addItems(
+        images.map((image) => ({ media: { url: image.url } })),
+      ),
+    )
+    .addSeparatorComponents(
+      new SeparatorBuilder()
+        .setDivider(true)
+        .setSpacing(SeparatorSpacingSize.Small),
+    );
+
+  if (includeButtons) {
+    container.addActionRowComponents(
+      buildPostButtons(messageId, likeCount, commentsLocked),
+    );
+  }
+
+  return container;
+}
+
+function buildPostButtons(
   messageId: string,
   likeCount: number,
   commentsLocked: boolean,
 ) {
-  return [
-    new ActionRowBuilder<ButtonBuilder>().addComponents(
-      new ButtonBuilder()
-        .setCustomId(`post:like:${messageId}`)
-        .setLabel(`Like · ${likeCount}`)
-        .setEmoji("❤️")
-        .setStyle(ButtonStyle.Secondary),
-      new ButtonBuilder()
-        .setCustomId(`post:comment:${messageId}`)
-        .setLabel("تعليق")
-        .setEmoji("💬")
-        .setStyle(ButtonStyle.Secondary)
-        .setDisabled(commentsLocked),
-      new ButtonBuilder()
-        .setCustomId(`post:settings:${messageId}`)
-        .setEmoji("⚙️")
-        .setStyle(ButtonStyle.Secondary),
-    ),
-  ];
+  return new ActionRowBuilder<ButtonBuilder>().addComponents(
+    new ButtonBuilder()
+      .setCustomId(`post:like:${messageId}`)
+      .setLabel(`Like · ${likeCount}`)
+      .setEmoji("❤️")
+      .setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder()
+      .setCustomId(`post:comment:${messageId}`)
+      .setLabel("تعليق")
+      .setEmoji("💬")
+      .setStyle(ButtonStyle.Secondary)
+      .setDisabled(commentsLocked),
+    new ButtonBuilder()
+      .setCustomId(`post:settings:${messageId}`)
+      .setEmoji("⚙️")
+      .setStyle(ButtonStyle.Secondary),
+  );
 }
 
-function buildEmbeds(
+function buildLegacyEmbeds(
   post: Pick<ImagePost, "author_name" | "author_avatar_url" | "caption">,
   images: Array<{ fileName: string; url: string }>,
 ) {
@@ -204,13 +253,12 @@ function buildEmbeds(
     }
 
     if (index === images.length - 1) {
-      embed.setFooter({ text: separator });
+      embed.setFooter({ text: legacySeparator });
     }
 
     return embed;
   });
 }
-
 function canManagePost(
   interaction: ButtonInteraction | ModalSubmitInteraction,
   post: ImagePost,
@@ -243,6 +291,30 @@ async function fetchPostMessage(post: ImagePost) {
   return { channel, message, images };
 }
 
+async function editPostCard(
+  message: Message,
+  post: ImagePost | Pick<ImagePost, "author_name" | "author_avatar_url" | "caption">,
+  images: Array<{ fileName: string; url: string }>,
+  messageId: string,
+  likeCount: number,
+  commentsLocked: boolean,
+) {
+  if (!message.flags.has(MessageFlags.IsComponentsV2)) {
+    await message.edit({
+      embeds: buildLegacyEmbeds(post, images),
+      components: [buildPostButtons(messageId, likeCount, commentsLocked)],
+    });
+    return;
+  }
+
+  await message.edit({
+    components: [
+      buildPostContainer(post, images, messageId, likeCount, commentsLocked),
+    ],
+    flags: MessageFlags.IsComponentsV2,
+  });
+}
+
 async function updatePostCaption(post: ImagePost, caption: string) {
   const updatedPost = { ...post, caption };
   const { message, images } = await fetchPostMessage(updatedPost);
@@ -250,7 +322,15 @@ async function updatePostCaption(post: ImagePost, caption: string) {
     `UPDATE discord_image_posts SET caption = $2 WHERE message_id = $1`,
     [post.message_id, caption],
   );
-  await message.edit({ embeds: buildEmbeds(updatedPost, images) });
+  const likeCount = await getLikeCount(post.message_id);
+  await editPostCard(
+    message,
+    updatedPost,
+    images,
+    post.message_id,
+    likeCount,
+    post.comments_locked,
+  );
 }
 
 function makeCaptionModal(post: ImagePost) {
@@ -338,9 +418,15 @@ async function toggleLike(interaction: ButtonInteraction, post: ImagePost) {
 
   const likeCount = await getLikeCount(post.message_id);
   await interaction.deferUpdate();
-  await interaction.message.edit({
-    components: buildButtons(post.message_id, likeCount, post.comments_locked),
-  });
+  const { message, images } = await fetchPostMessage(post);
+  await editPostCard(
+    message,
+    post,
+    images,
+    post.message_id,
+    likeCount,
+    post.comments_locked,
+  );
 }
 
 async function handleButton(interaction: ButtonInteraction) {
@@ -390,10 +476,15 @@ async function handleButton(interaction: ButtonInteraction) {
     );
     const updatedPost = { ...post, comments_locked: commentsLocked };
     const likeCount = await getLikeCount(post.message_id);
-    const { message } = await fetchPostMessage(updatedPost);
-    await message.edit({
-      components: buildButtons(post.message_id, likeCount, commentsLocked),
-    });
+    const { message, images } = await fetchPostMessage(updatedPost);
+    await editPostCard(
+      message,
+      updatedPost,
+      images,
+      post.message_id,
+      likeCount,
+      commentsLocked,
+    );
     await replyPrivately(
       interaction,
       commentsLocked ? "تم قفل التعليقات." : "تم فتح التعليقات.",
@@ -610,15 +701,17 @@ async function handleImageMessage(message: Message) {
 
   const existingPost = await getPost(message.id);
   if (existingPost) {
-    const replacement = await message.channel.messages.fetch(existingPost.message_id);
+    const { message: replacement, images: existingImages } =
+      await fetchPostMessage(existingPost);
     const likeCount = await getLikeCount(existingPost.message_id);
-    await replacement.edit({
-      components: buildButtons(
-        existingPost.message_id,
-        likeCount,
-        existingPost.comments_locked,
-      ),
-    });
+    await editPostCard(
+      replacement,
+      existingPost,
+      existingImages,
+      existingPost.message_id,
+      likeCount,
+      existingPost.comments_locked,
+    );
     await message.delete();
     writeLog("info", "image_post_recovered", {
       channelId,
@@ -631,6 +724,11 @@ async function handleImageMessage(message: Message) {
   let sentMessage: Message | null = null;
   let postSaved = false;
   let stage = "download_images";
+  let postPresentation: Pick<
+    ImagePost,
+    "author_name" | "author_avatar_url" | "caption"
+  > | null = null;
+  let postImages: Array<{ fileName: string; url: string }> = [];
 
   try {
     const downloadedImages = await Promise.all(
@@ -638,27 +736,27 @@ async function handleImageMessage(message: Message) {
         downloadImage(image, safeFileName(message.id, index, image.name)),
       ),
     );
-    const temporaryPost = {
+    postPresentation = {
       author_name: message.member?.displayName ?? message.author.username,
       author_avatar_url: message.author.displayAvatarURL({ extension: "png", size: 128 }),
       caption: message.content.slice(0, maxCaptionLength),
     };
-    const initialEmbeds = buildEmbeds(
-      temporaryPost,
-      downloadedImages.map(({ fileName }) => ({
+    postImages = downloadedImages.map(({ fileName }) => ({
         fileName,
         url: `attachment://${fileName}`,
-      })),
-    );
+      }));
 
     stage = "send_embed";
     sentMessage = await message.channel.send({
-      embeds: initialEmbeds,
+      components: [
+        buildPostContainer(postPresentation, postImages, message.id, 0, false, false),
+      ],
+      flags: MessageFlags.IsComponentsV2,
       files: downloadedImages.map((image) => image.attachment),
       allowedMentions: { parse: [] },
     });
     stage = "save_post";
-    const storedImageNames = downloadedImages.map(({ fileName }) => fileName);
+    const storedImageNames = postImages.map(({ fileName }) => fileName);
 
     await pool.query(
       `INSERT INTO discord_image_posts
@@ -670,18 +768,16 @@ async function handleImageMessage(message: Message) {
         message.id,
         message.channelId,
         message.author.id,
-        temporaryPost.author_name,
-        temporaryPost.author_avatar_url,
-        temporaryPost.caption,
+        postPresentation.author_name,
+        postPresentation.author_avatar_url,
+        postPresentation.caption,
         JSON.stringify(storedImageNames),
       ],
     );
     postSaved = true;
 
     stage = "add_buttons";
-    await sentMessage.edit({
-      components: buildButtons(sentMessage.id, 0, false),
-    });
+    await editPostCard(sentMessage, postPresentation, postImages, sentMessage.id, 0, false);
 
     stage = "delete_original";
     await message.delete();
@@ -692,11 +788,17 @@ async function handleImageMessage(message: Message) {
       imageCount: downloadedImages.length,
     });
   } catch (error) {
-    if (sentMessage && postSaved && stage === "add_buttons") {
+    if (sentMessage && postSaved && stage === "add_buttons" && postPresentation) {
+      const retryMessage = sentMessage;
       const likeCount = await getLikeCount(sentMessage.id).catch(() => 0);
-      await sentMessage
-        .edit({ components: buildButtons(sentMessage.id, likeCount, false) })
-        .catch(() => null);
+      await editPostCard(
+        retryMessage,
+        postPresentation,
+        postImages,
+        retryMessage.id,
+        likeCount,
+        false,
+      ).catch(() => null);
     }
 
     if (error instanceof UserFacingError) {
