@@ -21,10 +21,12 @@ import {
   TextChannel,
   TextInputBuilder,
   TextInputStyle,
+  UserSelectMenuBuilder,
   type Attachment,
   type ButtonInteraction,
   type Message,
   type ModalSubmitInteraction,
+  type UserSelectMenuInteraction,
 } from "discord.js";
 import { Pool, type QueryResultRow } from "pg";
 
@@ -37,6 +39,7 @@ function requireEnvironmentValue(name: string) {
 const token = requireEnvironmentValue("DISCORD_BOT_TOKEN");
 const channelId = requireEnvironmentValue("DISCORD_CHANNEL_ID");
 const formattedMessageChannelId = "1546491155406135296";
+const whisperChannelId = "1546492836592222279";
 const databaseUrl = requireEnvironmentValue("DATABASE_URL");
 const retrySourceMessageId = process.env.DISCORD_RETRY_SOURCE_MESSAGE_ID;
 const maxUploadBytes = 8 * 1024 * 1024;
@@ -76,6 +79,19 @@ type ImagePost = {
   images: string[];
   comments_locked: boolean;
   thread_id: string | null;
+};
+
+type WhisperMode = "anonymous" | "identified";
+
+type WhisperMessageRow = QueryResultRow & {
+  whisper_id: string;
+  channel_id: string;
+  message_id: string | null;
+  recipient_id: string;
+  sender_name: string | null;
+  body: string;
+  anonymous: boolean;
+  created_at: Date;
 };
 
 type DownloadedImage = {
@@ -153,6 +169,24 @@ async function initializeDatabase() {
       user_id text NOT NULL,
       created_at timestamptz NOT NULL DEFAULT now(),
       PRIMARY KEY (message_id, user_id)
+    )
+  `);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS discord_whisper_messages (
+      whisper_id text PRIMARY KEY,
+      channel_id text NOT NULL,
+      message_id text,
+      recipient_id text NOT NULL,
+      sender_name text,
+      body text NOT NULL,
+      anonymous boolean NOT NULL DEFAULT false,
+      created_at timestamptz NOT NULL DEFAULT now()
+    )
+  `);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS discord_whisper_panels (
+      channel_id text PRIMARY KEY,
+      message_id text NOT NULL
     )
   `);
 }
@@ -541,6 +575,129 @@ function makeCommentModal(messageId: string) {
     .addComponents(new ActionRowBuilder<TextInputBuilder>().addComponents(input));
 }
 
+function isWhisperMode(value: string | undefined): value is WhisperMode {
+  return value === "anonymous" || value === "identified";
+}
+
+function buildWhisperPanelEmbed() {
+  return new EmbedBuilder()
+    .setColor(0x7658d6)
+    .setTitle("💬 قسم الهمسة")
+    .setDescription(
+      [
+        "أرسل رسالة خاصة إلى أي عضو في السيرفر.",
+        "",
+        "🕵️ **همسة مجهولة:** لا تظهر هوية المرسل للمستلم.",
+        "👤 **همسة معلومة:** يظهر اسم المرسل للمستلم فقط.",
+        "",
+        "محتوى الهمسة لا يظهر في القناة، ولا يستطيع فتحه إلا المستلم المحدد.",
+        "",
+        "━━━━━━━━━━━━━━━━━━━━",
+      ].join("\n"),
+    )
+    .setFooter({ text: "اضغط «إرسال همسة» للبدء." });
+}
+
+function buildWhisperPanelButtons() {
+  return new ActionRowBuilder<ButtonBuilder>().addComponents(
+    new ButtonBuilder()
+      .setCustomId("whisper:send")
+      .setLabel("إرسال همسة")
+      .setEmoji("✉️")
+      .setStyle(ButtonStyle.Primary),
+  );
+}
+
+function buildWhisperModeButtons() {
+  return new ActionRowBuilder<ButtonBuilder>().addComponents(
+    new ButtonBuilder()
+      .setCustomId("whisper:mode:anonymous")
+      .setLabel("إرسال من مجهول")
+      .setEmoji("🕵️")
+      .setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder()
+      .setCustomId("whisper:mode:identified")
+      .setLabel("إرسال باسمي")
+      .setEmoji("👤")
+      .setStyle(ButtonStyle.Primary),
+  );
+}
+
+function buildWhisperRecipientSelect(mode: WhisperMode) {
+  return new ActionRowBuilder<UserSelectMenuBuilder>().addComponents(
+    new UserSelectMenuBuilder()
+      .setCustomId(`whisper:recipient:${mode}`)
+      .setPlaceholder("اختر مستلم الهمسة")
+      .setMinValues(1)
+      .setMaxValues(1),
+  );
+}
+
+function makeWhisperModal(mode: WhisperMode, recipientId: string) {
+  const input = new TextInputBuilder()
+    .setCustomId("body")
+    .setLabel("اكتب نص الهمسة")
+    .setStyle(TextInputStyle.Paragraph)
+    .setRequired(true)
+    .setMaxLength(1_500);
+
+  return new ModalBuilder()
+    .setCustomId(`whisper:submit:${mode}:${recipientId}`)
+    .setTitle(mode === "anonymous" ? "إرسال همسة مجهولة" : "إرسال همسة معلومة")
+    .addComponents(new ActionRowBuilder<TextInputBuilder>().addComponents(input));
+}
+
+function buildWhisperCardEmbed(mode: WhisperMode) {
+  return new EmbedBuilder()
+    .setColor(mode === "anonymous" ? 0x252a34 : 0x7658d6)
+    .setTitle(mode === "anonymous" ? "🕵️ همسة مجهولة" : "💬 همسة خاصة")
+    .setDescription(
+      [
+        "🔒 **رسالة مقفلة**",
+        "اضغط الزر لفتحها إذا كنت المستلم.",
+        "",
+        "━━━━━━━━━━━━━━━━━━━━",
+      ].join("\n"),
+    )
+    .setFooter({ text: "محتوى الهمسة لا يظهر إلا للمستلم" })
+    .setTimestamp();
+}
+
+function buildWhisperOpenButton(whisperId: string) {
+  return new ActionRowBuilder<ButtonBuilder>().addComponents(
+    new ButtonBuilder()
+      .setCustomId(`whisper:open:${whisperId}`)
+      .setLabel("فتح الهمسة")
+      .setEmoji("🔒")
+      .setStyle(ButtonStyle.Primary),
+  );
+}
+
+function buildPrivateWhisperEmbed(whisper: WhisperMessageRow) {
+  const embed = new EmbedBuilder()
+    .setColor(whisper.anonymous ? 0x252a34 : 0x7658d6)
+    .setTitle(whisper.anonymous ? "🕵️ همسة مجهولة" : "💬 همسة خاصة")
+    .setDescription(whisper.body)
+    .setTimestamp(whisper.created_at);
+
+  if (!whisper.anonymous && whisper.sender_name) {
+    embed.addFields({ name: "المرسل", value: whisper.sender_name });
+  }
+
+  return embed;
+}
+
+async function getWhisper(whisperId: string) {
+  const result = await pool.query<WhisperMessageRow>(
+    `SELECT whisper_id, channel_id, message_id, recipient_id, sender_name,
+            body, anonymous, created_at
+     FROM discord_whisper_messages
+     WHERE whisper_id = $1`,
+    [whisperId],
+  );
+  return result.rows[0] ?? null;
+}
+
 async function replyPrivately(
   interaction: ButtonInteraction | ModalSubmitInteraction,
   content: string,
@@ -548,7 +705,7 @@ async function replyPrivately(
   const deferredEphemeralReply =
     interaction.isModalSubmit() ||
     (interaction.isButton() &&
-      ["settings", "toggle_comments", "request_delete"].includes(
+      ["settings", "toggle_comments", "request_delete", "open"].includes(
         interaction.customId.split(":")[1] ?? "",
       ));
 
@@ -679,8 +836,216 @@ async function toggleLike(interaction: ButtonInteraction, post: ImagePost) {
   }
 }
 
+async function handleWhisperButton(
+  interaction: ButtonInteraction,
+  action: string | undefined,
+  value: string | undefined,
+) {
+  if (interaction.channelId !== whisperChannelId) {
+    await replyPrivately(interaction, "هذا الزر غير متاح هنا.");
+    return;
+  }
+
+  if (action === "send") {
+    const panel = await pool.query<{ message_id: string }>(
+      `SELECT message_id
+       FROM discord_whisper_panels
+       WHERE channel_id = $1`,
+      [whisperChannelId],
+    );
+    if (panel.rows[0]?.message_id !== interaction.message.id) {
+      await replyPrivately(interaction, "لوحة الهمسات لم تعد متاحة.");
+      return;
+    }
+
+    await interaction.reply({
+      content: "اختر طريقة إرسال الهمسة:",
+      components: [buildWhisperModeButtons()],
+      ephemeral: true,
+    });
+    return;
+  }
+
+  if (action === "mode") {
+    if (!isWhisperMode(value)) {
+      await interaction.update({
+        content: "تعذر اختيار طريقة الإرسال. أعد المحاولة من لوحة الهمسات.",
+        components: [],
+      });
+      return;
+    }
+
+    await interaction.update({
+      content:
+        value === "anonymous"
+          ? "اختر الشخص الذي تريد إرسال الهمسة إليه. لن نُظهر هويتك للمستلم."
+          : "اختر الشخص الذي تريد إرسال الهمسة إليه. سيظهر اسمك للمستلم فقط.",
+      components: [buildWhisperRecipientSelect(value)],
+    });
+    return;
+  }
+
+  if (action === "open" && value) {
+    await interaction.deferReply({ ephemeral: true });
+    const whisper = await getWhisper(value);
+    if (
+      !whisper ||
+      whisper.channel_id !== whisperChannelId ||
+      whisper.message_id !== interaction.message.id
+    ) {
+      await interaction.editReply("هذه الهمسة لم تعد متاحة.");
+      return;
+    }
+
+    if (interaction.user.id !== whisper.recipient_id) {
+      await interaction.editReply("هذه الهمسة مخصصة للمستلم المحدد فقط.");
+      return;
+    }
+
+    await interaction.editReply({
+      content: "محتوى الهمسة الخاصة بك:",
+      embeds: [buildPrivateWhisperEmbed(whisper)],
+      allowedMentions: { parse: [] },
+    });
+  }
+}
+
+async function handleWhisperRecipientSelect(
+  interaction: UserSelectMenuInteraction,
+) {
+  const [prefix, action, mode] = interaction.customId.split(":");
+  const recipientId = interaction.values[0];
+  if (
+    prefix !== "whisper" ||
+    action !== "recipient" ||
+    !isWhisperMode(mode) ||
+    interaction.channelId !== whisperChannelId ||
+    !interaction.guildId ||
+    !recipientId
+  ) {
+    await interaction.reply({
+      content: "تعذر تحديد مستلم الهمسة. أعد المحاولة من لوحة الهمسات.",
+      ephemeral: true,
+    });
+    return;
+  }
+
+  await interaction.showModal(makeWhisperModal(mode, recipientId));
+}
+
+async function handleWhisperSubmit(
+  interaction: ModalSubmitInteraction,
+  mode: string | undefined,
+  recipientId: string | undefined,
+) {
+  await interaction.deferReply({ ephemeral: true });
+  if (
+    !isWhisperMode(mode) ||
+    !recipientId ||
+    interaction.channelId !== whisperChannelId ||
+    !interaction.guildId
+  ) {
+    await interaction.editReply("تعذر إرسال الهمسة. ابدأ من لوحة الهمسات وحاول مرة أخرى.");
+    return;
+  }
+
+  const body = interaction.fields.getTextInputValue("body").trim();
+  if (!body) {
+    await interaction.editReply("اكتب نص الهمسة قبل الإرسال.");
+    return;
+  }
+
+  const channel = await client.channels.fetch(whisperChannelId);
+  if (
+    !channel ||
+    channel.type !== ChannelType.GuildText ||
+    channel.guildId !== interaction.guildId
+  ) {
+    await interaction.editReply("قناة الهمسات غير متاحة حالياً.");
+    return;
+  }
+
+  if (getWhisperChannelMissingPermissions(channel).length > 0) {
+    await interaction.editReply("البوت لا يملك الصلاحيات اللازمة لإرسال الهمسة.");
+    return;
+  }
+
+  const recipient = await channel.guild.members.fetch(recipientId).catch(() => null);
+  if (!recipient || recipient.user.bot) {
+    await interaction.editReply("اختر عضواً موجوداً في السيرفر لاستلام الهمسة.");
+    return;
+  }
+
+  let senderName: string | null = null;
+  if (mode === "identified") {
+    const sender = await channel.guild.members
+      .fetch(interaction.user.id)
+      .catch(() => null);
+    senderName =
+      sender?.displayName ?? interaction.user.globalName ?? interaction.user.username;
+  }
+  const whisperId = interaction.id;
+
+  let cardMessage: Message | null = null;
+  try {
+    await pool.query(
+      `INSERT INTO discord_whisper_messages
+         (whisper_id, channel_id, recipient_id, sender_name, body, anonymous)
+       VALUES ($1, $2, $3, $4, $5, $6)`,
+      [
+        whisperId,
+        whisperChannelId,
+        recipientId,
+        senderName,
+        body,
+        mode === "anonymous",
+      ],
+    );
+    cardMessage = await channel.send({
+      content: `<@${recipientId}>`,
+      embeds: [buildWhisperCardEmbed(mode)],
+      components: [buildWhisperOpenButton(whisperId)],
+      allowedMentions: { parse: [], users: [recipientId] },
+    });
+    await pool.query(
+      `UPDATE discord_whisper_messages
+       SET message_id = $2
+       WHERE whisper_id = $1`,
+      [whisperId, cardMessage.id],
+    );
+  } catch (error) {
+    if (cardMessage) {
+      await cardMessage.delete().catch((cleanupError: unknown) => {
+        writeLog("warn", "whisper_card_cleanup_failed", {
+          channelId: whisperChannelId,
+          ...safeErrorDetails(cleanupError),
+        });
+      });
+    }
+    await pool
+      .query(`DELETE FROM discord_whisper_messages WHERE whisper_id = $1`, [whisperId])
+      .catch(() => undefined);
+    writeLog("error", "whisper_send_failed", {
+      channelId: whisperChannelId,
+      ...safeErrorDetails(error),
+    });
+    await interaction.editReply("تعذر إرسال الهمسة. لم يُنشر محتواها في القناة.");
+    return;
+  }
+
+  await interaction.editReply(
+    mode === "anonymous"
+      ? `تم إرسال همستك المجهولة إلى ${recipient.displayName}.`
+      : `تم إرسال همستك إلى ${recipient.displayName}. سيظهر اسمك له فقط.`,
+  );
+}
+
 async function handleButton(interaction: ButtonInteraction) {
   const [prefix, action, messageId] = interaction.customId.split(":");
+  if (prefix === "whisper") {
+    await handleWhisperButton(interaction, action, messageId);
+    return;
+  }
   if (prefix !== "post" || !action || !messageId) return;
 
   if (action === "comment") {
@@ -816,7 +1181,11 @@ async function getOrCreateCommentThread(post: ImagePost) {
 }
 
 async function handleModalSubmit(interaction: ModalSubmitInteraction) {
-  const [prefix, action, messageId] = interaction.customId.split(":");
+  const [prefix, action, messageId, recipientId] = interaction.customId.split(":");
+  if (prefix === "whisper" && action === "submit") {
+    await handleWhisperSubmit(interaction, messageId, recipientId);
+    return;
+  }
   if (prefix !== "post" || !action || !messageId) return;
   if (action !== "caption_submit" && action !== "comment_submit") return;
 
@@ -1327,6 +1696,88 @@ async function validateFormattedMessageChannel() {
   }
 }
 
+function getWhisperChannelMissingPermissions(channel: TextChannel) {
+  const requiredPermissions: Array<[bigint, string]> = [
+    [PermissionFlagsBits.ViewChannel, "View Channel"],
+    [PermissionFlagsBits.ReadMessageHistory, "Read Message History"],
+    [PermissionFlagsBits.SendMessages, "Send Messages"],
+    [PermissionFlagsBits.EmbedLinks, "Embed Links"],
+  ];
+  const member = channel.guild.members.me;
+  const permissions = member ? channel.permissionsFor(member) : null;
+  return permissions
+    ? requiredPermissions
+        .filter(([permission]) => !permissions.has(permission))
+        .map(([, name]) => name)
+    : requiredPermissions.map(([, name]) => name);
+}
+
+async function ensureWhisperPanel() {
+  const channel = await client.channels.fetch(whisperChannelId);
+  if (!channel || channel.type !== ChannelType.GuildText) {
+    writeLog("error", "whisper_channel_unavailable", {
+      channelId: whisperChannelId,
+    });
+    return;
+  }
+
+  const missingPermissions = getWhisperChannelMissingPermissions(channel);
+  if (missingPermissions.length > 0) {
+    writeLog("warn", "whisper_channel_permissions_missing", {
+      channelId: whisperChannelId,
+      permissions: missingPermissions.join(", "),
+    });
+    return;
+  }
+
+  const storedPanel = await pool.query<{ message_id: string }>(
+    `SELECT message_id
+     FROM discord_whisper_panels
+     WHERE channel_id = $1`,
+    [whisperChannelId],
+  );
+  const previousMessageId = storedPanel.rows[0]?.message_id;
+  const previousPanel = previousMessageId
+    ? await channel.messages.fetch(previousMessageId).catch(() => null)
+    : null;
+
+  const panelPayload = {
+    embeds: [buildWhisperPanelEmbed()],
+    components: [buildWhisperPanelButtons()],
+    allowedMentions: { parse: [] as const },
+  };
+
+  if (previousPanel) {
+    await previousPanel.edit(panelPayload);
+    writeLog("info", "whisper_panel_ready", {
+      channelId: whisperChannelId,
+      messageId: previousPanel.id,
+      reused: true,
+    });
+    return;
+  }
+
+  const newPanel = await channel.send(panelPayload);
+  try {
+    await pool.query(
+      `INSERT INTO discord_whisper_panels (channel_id, message_id)
+       VALUES ($1, $2)
+       ON CONFLICT (channel_id)
+       DO UPDATE SET message_id = EXCLUDED.message_id`,
+      [whisperChannelId, newPanel.id],
+    );
+  } catch (error) {
+    await newPanel.delete().catch(() => undefined);
+    throw error;
+  }
+
+  writeLog("info", "whisper_panel_ready", {
+    channelId: whisperChannelId,
+    messageId: newPanel.id,
+    reused: false,
+  });
+}
+
 client.on(Events.MessageCreate, (message) => {
   void handleImageMessage(message).catch((error: unknown) => {
     writeLog("error", "message_handler_failed", {
@@ -1348,6 +1799,8 @@ client.on(Events.InteractionCreate, (interaction) => {
     ? handleButton(interaction)
     : interaction.isModalSubmit()
       ? handleModalSubmit(interaction)
+      : interaction.isUserSelectMenu()
+        ? handleWhisperRecipientSelect(interaction)
       : Promise.resolve();
   void action.catch(async (error: unknown) => {
     const interactionDetails: Record<string, string> = interaction.isButton()
@@ -1367,6 +1820,15 @@ client.on(Events.InteractionCreate, (interaction) => {
     });
     if (interaction.isButton() || interaction.isModalSubmit()) {
       await replyPrivately(interaction, "تعذر تنفيذ هذا الخيار حالياً. حاول مرة أخرى.");
+    } else if (
+      interaction.isUserSelectMenu() &&
+      !interaction.deferred &&
+      !interaction.replied
+    ) {
+      await interaction.reply({
+        content: "تعذر تنفيذ هذا الخيار حالياً. حاول مرة أخرى.",
+        ephemeral: true,
+      });
     }
   });
 });
@@ -1383,6 +1845,12 @@ client.once(Events.ClientReady, (readyClient) => {
   void validateFormattedMessageChannel().catch((error: unknown) => {
     writeLog("error", "formatted_message_channel_validation_failed", {
       channelId: formattedMessageChannelId,
+      ...safeErrorDetails(error),
+    });
+  });
+  void ensureWhisperPanel().catch((error: unknown) => {
+    writeLog("error", "whisper_panel_setup_failed", {
+      channelId: whisperChannelId,
       ...safeErrorDetails(error),
     });
   });
