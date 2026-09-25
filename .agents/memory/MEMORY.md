@@ -1,0 +1,1 @@
+- [Discord ephemeral button interactions](discord-ephemeral-controls.md) — ephemeral controls identify their reply message, so validate sub-actions by channel and stored post ID.

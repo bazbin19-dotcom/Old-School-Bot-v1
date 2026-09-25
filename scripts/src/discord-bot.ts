@@ -105,12 +105,28 @@ function writeLog(
 
 function safeErrorDetails(error: unknown) {
   if (!error || typeof error !== "object") return {};
-  const candidate = error as { name?: unknown; code?: unknown };
+  const candidate = error as {
+    name?: unknown;
+    code?: unknown;
+    message?: unknown;
+    status?: unknown;
+  };
+  const errorMessage =
+    typeof candidate.message === "string"
+      ? candidate.message
+          .replace(/\bpostgres(?:ql)?:\/\/\S+/gi, "[redacted connection]")
+          .replace(/https?:\/\/\S+/gi, "[url]")
+          .replace(/\b\d{17,20}\b/g, "[id]")
+          .slice(0, 180)
+      : undefined;
+
   return {
     errorName: typeof candidate.name === "string" ? candidate.name : "Error",
     ...(typeof candidate.code === "string" || typeof candidate.code === "number"
       ? { errorCode: String(candidate.code) }
       : {}),
+    ...(typeof candidate.status === "number" ? { errorStatus: candidate.status } : {}),
+    ...(errorMessage ? { errorMessage } : {}),
   };
 }
 
@@ -220,7 +236,7 @@ function buildPostButtons(
       .setCustomId(`post:like:${messageId}`)
       .setLabel(`Like · ${likeCount}`)
       .setEmoji("❤️")
-      .setStyle(ButtonStyle.Secondary),
+      .setStyle(likeCount > 0 ? ButtonStyle.Danger : ButtonStyle.Secondary),
     new ButtonBuilder()
       .setCustomId(`post:comment:${messageId}`)
       .setLabel("تعليق")
@@ -270,10 +286,14 @@ function canManagePost(
   );
 }
 
-function isPostMessage(interaction: ButtonInteraction, post: ImagePost) {
+function isPostMessage(
+  interaction: ButtonInteraction,
+  post: ImagePost,
+  allowEphemeralActionMessage = false,
+) {
   return (
-    interaction.message.id === post.message_id &&
-    interaction.message.channelId === post.channel_id
+    interaction.channelId === post.channel_id &&
+    (allowEphemeralActionMessage || interaction.message.id === post.message_id)
   );
 }
 
@@ -366,6 +386,18 @@ async function replyPrivately(
   interaction: ButtonInteraction | ModalSubmitInteraction,
   content: string,
 ) {
+  const deferredEphemeralReply =
+    interaction.isModalSubmit() ||
+    (interaction.isButton() &&
+      ["settings", "toggle_comments", "request_delete"].includes(
+        interaction.customId.split(":")[1] ?? "",
+      ));
+
+  if (interaction.deferred && deferredEphemeralReply) {
+    await interaction.editReply({ content, components: [] });
+    return;
+  }
+
   if (interaction.deferred || interaction.replied) {
     await interaction.followUp({ content, ephemeral: true });
   } else {
@@ -375,7 +407,9 @@ async function replyPrivately(
 
 async function showSettings(interaction: ButtonInteraction, post: ImagePost) {
   if (!canManagePost(interaction, post)) {
-    await replyPrivately(interaction, "يمكن لصاحب المنشور أو مشرف السيرفر إدارة هذا المنشور فقط.");
+    await interaction.editReply(
+      "يمكن لصاحب المنشور أو مشرف السيرفر إدارة هذا المنشور فقط.",
+    );
     return;
   }
 
@@ -394,10 +428,9 @@ async function showSettings(interaction: ButtonInteraction, post: ImagePost) {
       .setStyle(ButtonStyle.Danger),
   );
 
-  await interaction.reply({
+  await interaction.editReply({
     content: "إعدادات هذا المنشور:",
     components: [controls],
-    ephemeral: true,
   });
 }
 
@@ -417,7 +450,6 @@ async function toggleLike(interaction: ButtonInteraction, post: ImagePost) {
   }
 
   const likeCount = await getLikeCount(post.message_id);
-  await interaction.deferUpdate();
   const { message, images } = await fetchPostMessage(post);
   await editPostCard(
     message,
@@ -433,23 +465,42 @@ async function handleButton(interaction: ButtonInteraction) {
   const [prefix, action, messageId] = interaction.customId.split(":");
   if (prefix !== "post" || !action || !messageId) return;
 
+  if (action === "comment") {
+    await interaction.showModal(makeCommentModal(messageId));
+    return;
+  }
+
+  if (action === "like" || action === "confirm_delete") {
+    await interaction.deferUpdate();
+  } else if (
+    action === "settings" ||
+    action === "toggle_comments" ||
+    action === "request_delete"
+  ) {
+    await interaction.deferReply({ ephemeral: true });
+  }
+
   const post = await getPost(messageId);
-  if (!post || !isPostMessage(interaction, post)) {
+  const actionIsOnEphemeralReply = [
+    "edit_caption",
+    "toggle_comments",
+    "request_delete",
+    "confirm_delete",
+  ].includes(action);
+  if (!post || !isPostMessage(interaction, post, actionIsOnEphemeralReply)) {
+    if (
+      interaction.deferred &&
+      ["settings", "toggle_comments", "request_delete"].includes(action)
+    ) {
+      await interaction.editReply("هذا المنشور لم يعد متاحاً.");
+      return;
+    }
     await replyPrivately(interaction, "هذا المنشور لم يعد متاحاً.");
     return;
   }
 
   if (action === "like") {
     await toggleLike(interaction, post);
-    return;
-  }
-
-  if (action === "comment") {
-    if (post.comments_locked) {
-      await replyPrivately(interaction, "التعليقات مقفلة لهذا المنشور.");
-      return;
-    }
-    await interaction.showModal(makeCommentModal(post.message_id));
     return;
   }
 
@@ -485,8 +536,7 @@ async function handleButton(interaction: ButtonInteraction) {
       likeCount,
       commentsLocked,
     );
-    await replyPrivately(
-      interaction,
+    await interaction.editReply(
       commentsLocked ? "تم قفل التعليقات." : "تم فتح التعليقات.",
     );
     return;
@@ -499,16 +549,14 @@ async function handleButton(interaction: ButtonInteraction) {
         .setLabel("نعم، احذف المنشور والنقاش")
         .setStyle(ButtonStyle.Danger),
     );
-    await interaction.reply({
+    await interaction.editReply({
       content: "سيُحذف منشور الصورة ونقاشه وجميع الإعجابات المسجلة. هل تريد المتابعة؟",
       components: [confirmation],
-      ephemeral: true,
     });
     return;
   }
 
   if (action === "confirm_delete") {
-    await interaction.deferUpdate();
     const { channel, message } = await fetchPostMessage(post);
     if (post.thread_id) {
       const thread = await channel.threads.fetch(post.thread_id).catch(() => null);
@@ -552,20 +600,23 @@ async function getOrCreateCommentThread(post: ImagePost) {
 async function handleModalSubmit(interaction: ModalSubmitInteraction) {
   const [prefix, action, messageId] = interaction.customId.split(":");
   if (prefix !== "post" || !action || !messageId) return;
+  if (action !== "caption_submit" && action !== "comment_submit") return;
 
+  await interaction.deferReply({ ephemeral: true });
   const post = await getPost(messageId);
   if (!post || interaction.channelId !== post.channel_id) {
-    await replyPrivately(interaction, "هذا المنشور لم يعد متاحاً.");
+    await interaction.editReply("هذا المنشور لم يعد متاحاً.");
     return;
   }
 
   if (action === "caption_submit") {
     if (!canManagePost(interaction, post)) {
-      await replyPrivately(interaction, "يمكن لصاحب المنشور أو مشرف السيرفر تعديل النص فقط.");
+      await interaction.editReply(
+        "يمكن لصاحب المنشور أو مشرف السيرفر تعديل النص فقط.",
+      );
       return;
     }
     const caption = interaction.fields.getTextInputValue("caption");
-    await interaction.deferReply({ ephemeral: true });
     await updatePostCaption(post, caption);
     await interaction.editReply("تم تحديث كتابة المنشور.");
     return;
@@ -573,16 +624,15 @@ async function handleModalSubmit(interaction: ModalSubmitInteraction) {
 
   if (action === "comment_submit") {
     if (post.comments_locked) {
-      await replyPrivately(interaction, "التعليقات مقفلة لهذا المنشور.");
+      await interaction.editReply("التعليقات مقفلة لهذا المنشور.");
       return;
     }
     const comment = interaction.fields.getTextInputValue("comment").trim();
     if (!comment) {
-      await replyPrivately(interaction, "اكتب تعليقاً قبل الإرسال.");
+      await interaction.editReply("اكتب تعليقاً قبل الإرسال.");
       return;
     }
 
-    await interaction.deferReply({ ephemeral: true });
     const thread = await getOrCreateCommentThread(post);
     await thread.send({
       content: `**${interaction.user.username}**: ${comment}`,
@@ -928,7 +978,21 @@ client.on(Events.InteractionCreate, (interaction) => {
       ? handleModalSubmit(interaction)
       : Promise.resolve();
   void action.catch(async (error: unknown) => {
-    writeLog("error", "interaction_failed", safeErrorDetails(error));
+    const interactionDetails: Record<string, string> = interaction.isButton()
+      ? {
+          interactionType: "button",
+          action: interaction.customId.split(":")[1] ?? "unknown",
+        }
+      : interaction.isModalSubmit()
+        ? {
+            interactionType: "modal",
+            action: interaction.customId.split(":")[1] ?? "unknown",
+          }
+        : { interactionType: "other" };
+    writeLog("error", "interaction_failed", {
+      ...interactionDetails,
+      ...safeErrorDetails(error),
+    });
     if (interaction.isButton() || interaction.isModalSubmit()) {
       await replyPrivately(interaction, "تعذر تنفيذ هذا الخيار حالياً. حاول مرة أخرى.");
     }
