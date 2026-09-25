@@ -874,13 +874,23 @@ async function handleImageMessage(message: Message) {
       }));
 
     stage = "send_embed";
-    sentMessage = await message.channel.send({
+    const createdMessage = await message.channel.send({
       components: [
         buildPostContainer(postPresentation, postImages, message.id, 0, false, false),
       ],
       flags: MessageFlags.IsComponentsV2,
       files: downloadedImages.map((image) => image.attachment),
       allowedMentions: { parse: [] },
+    });
+    sentMessage = createdMessage;
+    postImages = postImages.map(({ fileName }) => {
+      const attachment = createdMessage.attachments.find(
+        (item) => item.name === fileName,
+      );
+      if (!attachment) {
+        throw new Error("An uploaded image attachment could not be found.");
+      }
+      return { fileName, url: attachment.url };
     });
     stage = "save_post";
     const storedImageNames = postImages.map(({ fileName }) => fileName);
