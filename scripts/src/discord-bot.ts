@@ -78,7 +78,7 @@ type ImagePost = {
 };
 
 type DownloadedImage = {
-  attachment: AttachmentBuilder;
+  buffer: Buffer;
   fileName: string;
 };
 
@@ -216,18 +216,21 @@ function buildPostContainer(
     );
   }
 
-  const container = new ContainerBuilder()
-    .addSectionComponents(header)
-    .addMediaGalleryComponents(
+  const container = new ContainerBuilder().addSectionComponents(header);
+
+  if (images.length > 0) {
+    container.addMediaGalleryComponents(
       new MediaGalleryBuilder().addItems(
         images.map((image) => ({ media: { url: image.url } })),
       ),
-    )
-    .addSeparatorComponents(
-      new SeparatorBuilder()
-        .setDivider(true)
-        .setSpacing(SeparatorSpacingSize.Small),
     );
+  }
+
+  container.addSeparatorComponents(
+    new SeparatorBuilder()
+      .setDivider(true)
+      .setSpacing(SeparatorSpacingSize.Small),
+  );
 
   if (includeButtons) {
     container.addActionRowComponents(
@@ -373,25 +376,79 @@ async function editPostCard(
   messageId: string,
   likeCount: number,
   commentsLocked: boolean,
-) {
+): Promise<Message> {
   const attachments = [...message.attachments.keys()].map((id) => ({ id }));
 
   if (!message.flags.has(MessageFlags.IsComponentsV2)) {
-    await message.edit({
+    return message.edit({
       embeds: buildLegacyEmbeds(post, images),
       components: [buildPostButtons(messageId, likeCount, commentsLocked)],
       attachments,
     });
-    return;
   }
 
-  await message.edit({
+  return message.edit({
     components: [
       buildPostContainer(post, images, messageId, likeCount, commentsLocked),
     ],
     flags: MessageFlags.IsComponentsV2,
     attachments,
   });
+}
+
+async function editPostCardWithUploads(
+  message: Message,
+  post: Pick<ImagePost, "author_name" | "author_avatar_url" | "caption">,
+  downloadedImages: DownloadedImage[],
+  messageId: string,
+  likeCount: number,
+  commentsLocked: boolean,
+): Promise<{ message: Message; images: Array<{ fileName: string; url: string }> }> {
+  const editedMessage = await message.edit({
+    components: [
+      buildPostContainer(post, [], messageId, likeCount, commentsLocked, false),
+    ],
+    flags: MessageFlags.IsComponentsV2,
+    attachments: [],
+    files: downloadedImages.map(
+      ({ buffer, fileName }) => new AttachmentBuilder(buffer, { name: fileName }),
+    ),
+  });
+
+  let uploadedMessage = editedMessage;
+  if (uploadedMessage.attachments.size < downloadedImages.length) {
+    const channel = await client.channels.fetch(message.channelId);
+    if (!channel || channel.type !== ChannelType.GuildText) {
+      throw new Error("The uploaded image post could not be re-fetched.");
+    }
+    uploadedMessage = await channel.messages.fetch(message.id);
+  }
+  if (uploadedMessage.attachments.size < downloadedImages.length) {
+    throw new Error("Discord did not retain the uploaded image files.");
+  }
+
+  const uploadedAttachments = [...uploadedMessage.attachments.values()];
+  const images = downloadedImages.map(({ fileName }, index) => {
+    const attachment =
+      uploadedMessage.attachments.find((item) => item.name === fileName) ??
+      uploadedAttachments[index];
+    if (!attachment) {
+      throw new Error("Discord did not return a usable URL for an uploaded image.");
+    }
+    return {
+      fileName: attachment.name ?? fileName,
+      url: attachment.url,
+    };
+  });
+  const finalMessage = await editPostCard(
+    uploadedMessage,
+    post,
+    images,
+    messageId,
+    likeCount,
+    commentsLocked,
+  );
+  return { message: finalMessage, images };
 }
 
 async function updatePostCaption(post: ImagePost, caption: string) {
@@ -768,7 +825,7 @@ async function downloadImage(
   }
 
   return {
-    attachment: new AttachmentBuilder(buffer, { name: fileName }),
+    buffer,
     fileName,
   };
 }
@@ -831,21 +888,39 @@ async function handleImageMessage(message: Message) {
 
   const existingPost = await getPost(message.id);
   if (existingPost) {
-    const { message: replacement, images: existingImages } =
-      await fetchPostMessage(existingPost);
-    const likeCount = await getLikeCount(existingPost.message_id);
-    await editPostCard(
-      replacement,
-      existingPost,
-      existingImages,
+    const replacement = await message.channel.messages.fetch(
       existingPost.message_id,
-      likeCount,
-      existingPost.comments_locked,
+    );
+    const recoveryImages = await Promise.all(
+      images.map((image, index) =>
+        downloadImage(
+          image,
+          existingPost.images[index] ??
+            safeFileName(message.id, index, image.name),
+        ),
+      ),
+    );
+    const likeCount = await getLikeCount(existingPost.message_id);
+    const { message: recoveredMessage, images: recoveredImages } =
+      await editPostCardWithUploads(
+        replacement,
+        existingPost,
+        recoveryImages,
+        existingPost.message_id,
+        likeCount,
+        existingPost.comments_locked,
+      );
+    await pool.query(
+      `UPDATE discord_image_posts SET images = $2::jsonb WHERE message_id = $1`,
+      [
+        existingPost.message_id,
+        JSON.stringify(recoveredImages.map(({ fileName }) => fileName)),
+      ],
     );
     await message.delete();
     writeLog("info", "image_post_recovered", {
       channelId,
-      postMessageId: existingPost.message_id,
+      postMessageId: recoveredMessage.id,
       sourceMessageId: message.id,
     });
     return;
@@ -858,10 +933,10 @@ async function handleImageMessage(message: Message) {
     ImagePost,
     "author_name" | "author_avatar_url" | "caption"
   > | null = null;
-  let postImages: Array<{ fileName: string; url: string }> = [];
+  let downloadedImages: DownloadedImage[] = [];
 
   try {
-    const downloadedImages = await Promise.all(
+    downloadedImages = await Promise.all(
       images.map((image, index) =>
         downloadImage(image, safeFileName(message.id, index, image.name)),
       ),
@@ -871,44 +946,18 @@ async function handleImageMessage(message: Message) {
       author_avatar_url: message.author.displayAvatarURL({ extension: "png", size: 128 }),
       caption: message.content.slice(0, maxCaptionLength),
     };
-    postImages = downloadedImages.map(({ fileName }) => ({
-        fileName,
-        url: `attachment://${fileName}`,
-      }));
 
     stage = "send_embed";
     const createdMessage = await message.channel.send({
       components: [
-        buildPostContainer(postPresentation, postImages, message.id, 0, false, false),
+        buildPostContainer(postPresentation, [], message.id, 0, false, false),
       ],
       flags: MessageFlags.IsComponentsV2,
-      files: downloadedImages.map((image) => image.attachment),
       allowedMentions: { parse: [] },
     });
     sentMessage = createdMessage;
-    let uploadedAttachments = [...createdMessage.attachments.values()];
-    let messageWithUploads = createdMessage;
-    if (uploadedAttachments.length < postImages.length) {
-      messageWithUploads = await message.channel.messages.fetch(createdMessage.id);
-      sentMessage = messageWithUploads;
-      uploadedAttachments = [...messageWithUploads.attachments.values()];
-    }
-    const uploadedGalleryUrls = getMediaGalleryUrls(messageWithUploads.components);
-    postImages = postImages.map(({ fileName }, index) => {
-      const attachment =
-        uploadedAttachments.find((item) => item.name === fileName) ??
-        uploadedAttachments[index];
-      const galleryUrl = uploadedGalleryUrls[index];
-      const url =
-        attachment?.url ??
-        (galleryUrl && !galleryUrl.startsWith("attachment://") ? galleryUrl : null);
-      if (!url) {
-        throw new Error("Discord did not return a usable URL for an uploaded image.");
-      }
-      return { fileName: attachment?.name ?? fileName, url };
-    });
     stage = "save_post";
-    const storedImageNames = postImages.map(({ fileName }) => fileName);
+    const storedImageNames = downloadedImages.map(({ fileName }) => fileName);
 
     await pool.query(
       `INSERT INTO discord_image_posts
@@ -929,7 +978,23 @@ async function handleImageMessage(message: Message) {
     postSaved = true;
 
     stage = "add_buttons";
-    await editPostCard(sentMessage, postPresentation, postImages, sentMessage.id, 0, false);
+    const { message: completedMessage, images: completedImages } =
+      await editPostCardWithUploads(
+        createdMessage,
+        postPresentation,
+        downloadedImages,
+        createdMessage.id,
+        0,
+        false,
+      );
+    sentMessage = completedMessage;
+    await pool.query(
+      `UPDATE discord_image_posts SET images = $2::jsonb WHERE message_id = $1`,
+      [
+        completedMessage.id,
+        JSON.stringify(completedImages.map(({ fileName }) => fileName)),
+      ],
+    );
 
     stage = "delete_original";
     await message.delete();
@@ -941,16 +1006,56 @@ async function handleImageMessage(message: Message) {
     });
   } catch (error) {
     if (sentMessage && postSaved && stage === "add_buttons" && postPresentation) {
-      const retryMessage = sentMessage;
-      const likeCount = await getLikeCount(sentMessage.id).catch(() => 0);
-      await editPostCard(
-        retryMessage,
-        postPresentation,
-        postImages,
-        retryMessage.id,
-        likeCount,
-        false,
-      ).catch(() => null);
+      let buttonsAndImagesRecovered = false;
+      try {
+        const { message: recoveredMessage, images: recoveredImages } =
+          await editPostCardWithUploads(
+            sentMessage,
+            postPresentation,
+            downloadedImages,
+            sentMessage.id,
+            await getLikeCount(sentMessage.id),
+            false,
+          );
+        sentMessage = recoveredMessage;
+        await pool.query(
+          `UPDATE discord_image_posts SET images = $2::jsonb WHERE message_id = $1`,
+          [
+            recoveredMessage.id,
+            JSON.stringify(recoveredImages.map(({ fileName }) => fileName)),
+          ],
+        );
+        buttonsAndImagesRecovered = true;
+      } catch (retryError) {
+        writeLog("warn", "image_post_button_retry_failed", {
+          channelId,
+          ...safeErrorDetails(retryError),
+        });
+        await pool
+          .query(`DELETE FROM discord_image_posts WHERE message_id = $1`, [
+            sentMessage.id,
+          ])
+          .catch(() => undefined);
+        postSaved = false;
+      }
+
+      if (buttonsAndImagesRecovered) {
+        stage = "delete_original";
+        try {
+          await message.delete();
+          writeLog("info", "image_post_recovered", {
+            channelId,
+            postMessageId: sentMessage.id,
+            sourceMessageId: message.id,
+          });
+          return;
+        } catch (deleteError) {
+          writeLog("warn", "image_post_source_cleanup_failed", {
+            channelId,
+            ...safeErrorDetails(deleteError),
+          });
+        }
+      }
     }
     if (sentMessage && !postSaved) {
       await sentMessage.delete().catch((cleanupError: unknown) => {
@@ -979,9 +1084,9 @@ async function handleImageMessage(message: Message) {
       });
       await sendMessageNotice(
         message,
-        sentMessage
-          ? "أنشأت بطاقة الصورة لكن لم تكتمل إضافة الأزرار؛ أبقيت الرسالة الأصلية ولم أحذفها."
-          : "تعذر تحويل الصورة؛ أبقيت الرسالة الأصلية كما هي.",
+        stage === "delete_original"
+          ? "تم إنشاء البطاقة التفاعلية، لكن تعذر حذف الرسالة الأصلية."
+          : "تعذر إكمال البطاقة التفاعلية؛ أبقيت الرسالة الأصلية كما هي.",
       );
     }
   }

@@ -9,4 +9,4 @@ When mapping uploaded files back to their returned attachments, do not rely only
 
 **Why:** Omitting attachment IDs can remove the files, while reusing `attachment://` during edits can make Discord reject the updated gallery. Strict filename matching can also fail after a successful upload and leave the post without controls.
 
-**How to apply:** After uploading files, resolve each image from the returned attachment collection by name or upload order, then rebuild the post with its direct URL. On every edit, preserve existing attachment IDs. For already-affected posts, recover a direct URL from the media gallery when possible.
+**How to apply:** After uploading files, resolve each image from the returned attachment collection by name or upload order, then rebuild the post with its direct URL. If uploads must happen in an edit, first upload without gallery references, then make a second edit using the returned direct URLs and attachment IDs. On every edit, preserve existing attachment IDs. For already-affected posts, recover a direct URL from the media gallery when possible.
