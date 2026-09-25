@@ -814,8 +814,8 @@ async function handleModalSubmit(interaction: ModalSubmitInteraction) {
 
     const thread = await getOrCreateCommentThread(post);
     await thread.send({
-      content: `**${interaction.user.username}**: ${comment}`,
-      allowedMentions: { parse: [] },
+      content: `<@${interaction.user.id}>: ${comment}`,
+      allowedMentions: { parse: [], users: [interaction.user.id] },
     });
     await interaction.editReply("تم نشر تعليقك في نقاش الصورة.");
   }
