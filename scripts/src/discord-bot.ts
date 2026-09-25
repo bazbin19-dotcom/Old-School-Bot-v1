@@ -92,6 +92,7 @@ type WhisperMessageRow = QueryResultRow & {
   body: string;
   anonymous: boolean;
   created_at: Date;
+  opened_at: Date | null;
 };
 
 type DownloadedImage = {
@@ -180,8 +181,18 @@ async function initializeDatabase() {
       sender_name text,
       body text NOT NULL,
       anonymous boolean NOT NULL DEFAULT false,
-      created_at timestamptz NOT NULL DEFAULT now()
+      created_at timestamptz NOT NULL DEFAULT now(),
+      retention_started_at timestamptz NOT NULL DEFAULT now(),
+      opened_at timestamptz
     )
+  `);
+  await pool.query(`
+    ALTER TABLE discord_whisper_messages
+    ADD COLUMN IF NOT EXISTS retention_started_at timestamptz NOT NULL DEFAULT now()
+  `);
+  await pool.query(`
+    ALTER TABLE discord_whisper_messages
+    ADD COLUMN IF NOT EXISTS opened_at timestamptz
   `);
   await pool.query(`
     CREATE TABLE IF NOT EXISTS discord_whisper_panels (
@@ -707,12 +718,106 @@ function buildPrivateWhisperEmbed(whisper: WhisperMessageRow) {
 async function getWhisper(whisperId: string) {
   const result = await pool.query<WhisperMessageRow>(
     `SELECT whisper_id, channel_id, message_id, recipient_id, sender_name,
-            body, anonymous, created_at
+            body, anonymous, created_at, opened_at
      FROM discord_whisper_messages
      WHERE whisper_id = $1`,
     [whisperId],
   );
   return result.rows[0] ?? null;
+}
+
+function isUnknownDiscordMessage(error: unknown) {
+  if (!error || typeof error !== "object") return false;
+  const code = (error as { code?: unknown }).code;
+  return code === 10008 || code === "10008";
+}
+
+let whisperExpirationCleanupRunning = false;
+let whisperExpirationCleanupTimer: NodeJS.Timeout | undefined;
+
+async function cleanupExpiredWhispers() {
+  if (whisperExpirationCleanupRunning) return;
+  whisperExpirationCleanupRunning = true;
+
+  try {
+    const expiredWhispers = await pool.query<{
+      whisper_id: string;
+      channel_id: string;
+      message_id: string | null;
+    }>(
+      `SELECT whisper_id, channel_id, message_id
+       FROM discord_whisper_messages
+       WHERE (opened_at IS NULL AND retention_started_at <= now() - interval '48 hours')
+          OR (opened_at IS NOT NULL AND opened_at <= now() - interval '24 hours')
+       ORDER BY created_at
+       LIMIT 100`,
+    );
+
+    let deletedCount = 0;
+    for (const whisper of expiredWhispers.rows) {
+      try {
+        await pool.query(
+          `UPDATE discord_whisper_messages
+           SET body = ''
+           WHERE whisper_id = $1
+             AND (
+               (opened_at IS NULL AND retention_started_at <= now() - interval '48 hours')
+               OR (opened_at IS NOT NULL AND opened_at <= now() - interval '24 hours')
+             )`,
+          [whisper.whisper_id],
+        );
+
+        if (whisper.message_id) {
+          const channel = await client.channels.fetch(whisper.channel_id);
+          if (!channel || channel.type !== ChannelType.GuildText) {
+            throw new Error("Expired whisper channel is unavailable.");
+          }
+
+          const message = await channel.messages
+            .fetch(whisper.message_id)
+            .catch((error: unknown) => {
+              if (isUnknownDiscordMessage(error)) return null;
+              throw error;
+            });
+          if (message) await message.delete();
+        }
+
+        const deleted = await pool.query(
+          `DELETE FROM discord_whisper_messages
+           WHERE whisper_id = $1
+             AND (
+               (opened_at IS NULL AND created_at <= now() - interval '48 hours')
+               OR (opened_at IS NOT NULL AND opened_at <= now() - interval '24 hours')
+             )`,
+          [whisper.whisper_id],
+        );
+        deletedCount += deleted.rowCount ?? 0;
+      } catch (error) {
+        writeLog("warn", "whisper_expiration_cleanup_item_failed", {
+          channelId: whisper.channel_id,
+          ...safeErrorDetails(error),
+        });
+      }
+    }
+
+    if (deletedCount > 0) {
+      writeLog("info", "expired_whispers_deleted", { count: deletedCount });
+    }
+  } catch (error) {
+    writeLog("error", "whisper_expiration_cleanup_failed", safeErrorDetails(error));
+  } finally {
+    whisperExpirationCleanupRunning = false;
+  }
+}
+
+function startWhisperExpirationCleanup() {
+  if (whisperExpirationCleanupTimer) return;
+  void cleanupExpiredWhispers();
+  whisperExpirationCleanupTimer = setInterval(
+    () => void cleanupExpiredWhispers(),
+    60_000,
+  );
+  whisperExpirationCleanupTimer.unref();
 }
 
 async function replyPrivately(
@@ -919,9 +1024,39 @@ async function handleWhisperButton(
       return;
     }
 
+    const openedResult = await pool.query<WhisperMessageRow>(
+      `UPDATE discord_whisper_messages
+       SET opened_at = COALESCE(opened_at, now())
+       WHERE whisper_id = $1
+         AND channel_id = $2
+         AND message_id = $3
+         AND recipient_id = $4
+         AND body <> ''
+         AND (
+           (opened_at IS NULL AND retention_started_at > now() - interval '48 hours')
+           OR (opened_at IS NOT NULL AND opened_at > now() - interval '24 hours')
+         )
+       RETURNING whisper_id, channel_id, message_id, recipient_id, sender_name,
+                 body, anonymous, created_at, opened_at`,
+      [
+        whisper.whisper_id,
+        whisperChannelId,
+        interaction.message.id,
+        interaction.user.id,
+      ],
+    );
+    const openedWhisper = openedResult.rows[0];
+    if (!openedWhisper?.opened_at) {
+      await interaction.editReply("انتهت مدة الهمسة ولم تعد متاحة.");
+      return;
+    }
+
+    const expiryTimestamp = Math.floor(
+      (openedWhisper.opened_at.getTime() + 24 * 60 * 60 * 1000) / 1000,
+    );
     await interaction.editReply({
-      content: "محتوى الهمسة الخاصة بك:",
-      embeds: [buildPrivateWhisperEmbed(whisper)],
+      content: `محتوى الهمسة الخاصة بك:\n⏳ تُحذف تلقائياً <t:${expiryTimestamp}:R>.`,
+      embeds: [buildPrivateWhisperEmbed(openedWhisper)],
       allowedMentions: { parse: [] },
     });
   }
@@ -1970,6 +2105,7 @@ client.once(Events.ClientReady, (readyClient) => {
       ...safeErrorDetails(error),
     });
   });
+  startWhisperExpirationCleanup();
   void retryConfiguredSourceMessage().catch((error: unknown) => {
     writeLog("error", "retry_source_failed", {
       sourceMessageId: retrySourceMessageId ?? "none",
@@ -1987,6 +2123,10 @@ client.on(Events.Error, (error) => {
 
 async function shutdown(signal: string) {
   writeLog("info", "shutdown_started", { signal });
+  if (whisperExpirationCleanupTimer) {
+    clearInterval(whisperExpirationCleanupTimer);
+    whisperExpirationCleanupTimer = undefined;
+  }
   client.destroy();
   await pool.end();
   process.exit(0);
