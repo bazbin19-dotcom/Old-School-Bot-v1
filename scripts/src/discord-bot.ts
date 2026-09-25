@@ -33,6 +33,7 @@ import {
   attachDailyPostRewards,
   initializeDailyPostRewardTables,
 } from "./daily-post-rewards.js";
+import { attachProfileCommand } from "./profile-command.js";
 
 function requireEnvironmentValue(name: string) {
   const value = process.env[name];
@@ -52,6 +53,7 @@ const legacySeparator = "──────────────────�
 
 const pool = new Pool({ connectionString: databaseUrl });
 let stopDailyPostRewards = () => {};
+let stopProfileCommand = () => {};
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
@@ -2158,6 +2160,7 @@ client.on(Events.Error, (error) => {
 async function shutdown(signal: string) {
   writeLog("info", "shutdown_started", { signal });
   stopDailyPostRewards();
+  stopProfileCommand();
   if (whisperExpirationCleanupTimer) {
     clearInterval(whisperExpirationCleanupTimer);
     whisperExpirationCleanupTimer = undefined;
@@ -2174,12 +2177,14 @@ async function main() {
   await initializeDatabase();
   await initializeDailyPostRewardTables(pool);
   stopDailyPostRewards = attachDailyPostRewards(client, pool);
+  stopProfileCommand = attachProfileCommand(client, pool);
   await client.login(token);
 }
 
 void main().catch(async (error: unknown) => {
   writeLog("error", "startup_failed", safeErrorDetails(error));
   stopDailyPostRewards();
+  stopProfileCommand();
   client.destroy();
   await pool.end().catch(() => undefined);
   process.exitCode = 1;
