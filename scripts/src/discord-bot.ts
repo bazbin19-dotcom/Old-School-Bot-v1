@@ -1126,6 +1126,7 @@ async function handleFormattedTextMessage(message: Message) {
     message.channelId !== formattedMessageChannelId ||
     !message.inGuild() ||
     message.channel.type !== ChannelType.GuildText ||
+    message.attachments.size > 0 ||
     !message.content.trim()
   ) {
     return;
