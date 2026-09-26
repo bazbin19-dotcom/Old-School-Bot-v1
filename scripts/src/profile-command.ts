@@ -357,6 +357,7 @@ async function fetchProfilePublicMessage(
 }
 
 async function replaceProfileImage(
+  client: Client,
   message: Message,
   view: ProfileView,
   image: Buffer,
@@ -385,9 +386,27 @@ async function replaceProfileImage(
     newAttachment = findUploadedAttachment(uploadedMessage);
   }
   if (!newAttachment) {
-    throw new Error(
-      "The updated profile image attachment was missing after refreshing the message.",
-    );
+    const channel = await client.channels.fetch(profileCommandChannelId);
+    if (
+      !channel ||
+      channel.type !== ChannelType.GuildText ||
+      channel.id !== message.channelId
+    ) {
+      throw new Error("The profile channel is unavailable for message recovery.");
+    }
+
+    await channel.send({
+      components: [buildProfileContainer(view, `attachment://${fileName}`)],
+      flags: MessageFlags.IsComponentsV2,
+      files: [new AttachmentBuilder(image, { name: fileName })],
+      allowedMentions: { parse: [] },
+    });
+    await message.delete().catch((error: unknown) => {
+      logProfileError("profile_old_message_cleanup_failed", error, {
+        channelId: message.channelId,
+      });
+    });
+    return;
   }
 
   await uploadedMessage.edit({
@@ -412,7 +431,7 @@ async function refreshProfileMessage(
     requestedPage,
   );
   const image = await renderProfileCard(view.card);
-  await replaceProfileImage(message, view, image);
+  await replaceProfileImage(client, message, view, image);
 }
 
 function makeProfileSettingsMenu(
