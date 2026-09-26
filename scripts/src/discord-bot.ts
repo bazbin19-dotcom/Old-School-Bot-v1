@@ -43,6 +43,10 @@ import {
   initializeTaskListTables,
 } from "./task-list-feature.js";
 import {
+  attachForestLinkFeature,
+  initializeForestLinkTables,
+} from "./forest-link-feature.js";
+import {
   profileImagePostChannelId,
   profileXpPerPost,
 } from "./profile-store.js";
@@ -69,6 +73,7 @@ const pool = new Pool({ connectionString: databaseUrl });
 let stopDailyPostRewards = () => {};
 let stopProfileCommand = () => {};
 let stopTaskListFeature = () => {};
+let stopForestLinkFeature = () => {};
 const commentMemberRemovalTimers = new Map<string, NodeJS.Timeout>();
 const commentMemberQueues = new Map<string, Promise<void>>();
 const client = new Client({
@@ -2549,6 +2554,7 @@ async function shutdown(signal: string) {
   stopDailyPostRewards();
   stopProfileCommand();
   stopTaskListFeature();
+  stopForestLinkFeature();
   if (whisperExpirationCleanupTimer) {
     clearInterval(whisperExpirationCleanupTimer);
     whisperExpirationCleanupTimer = undefined;
@@ -2570,9 +2576,11 @@ async function main() {
   await initializeDailyPostRewardTables(pool);
   await initializeProfileTables(pool);
   await initializeTaskListTables(pool);
+  await initializeForestLinkTables(pool);
   stopDailyPostRewards = attachDailyPostRewards(client, pool);
   stopProfileCommand = attachProfileCommand(client, pool);
   stopTaskListFeature = attachTaskListFeature(client, pool);
+  stopForestLinkFeature = attachForestLinkFeature(client, pool);
   await client.login(token);
 }
 
@@ -2581,6 +2589,7 @@ void main().catch(async (error: unknown) => {
   stopDailyPostRewards();
   stopProfileCommand();
   stopTaskListFeature();
+  stopForestLinkFeature();
   client.destroy();
   await pool.end().catch(() => undefined);
   process.exitCode = 1;
