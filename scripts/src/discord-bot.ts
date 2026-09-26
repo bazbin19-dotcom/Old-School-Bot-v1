@@ -1,5 +1,6 @@
 import {
   ActionRowBuilder,
+  ActivityType,
   AttachmentBuilder,
   ButtonBuilder,
   ButtonStyle,
@@ -68,12 +69,14 @@ const maxCaptionLength = 2_000;
 const legacySeparator = "────────────────────────────────";
 const commentInactivityMs = 5 * 60_000;
 const commentRemovalRetryMs = 60_000;
+const botActivityMessages = ["Old School", "The Best", "OS Server"] as const;
 
 const pool = new Pool({ connectionString: databaseUrl });
 let stopDailyPostRewards = () => {};
 let stopProfileCommand = () => {};
 let stopTaskListFeature = () => {};
 let stopForestLinkFeature = () => {};
+let botActivityTimer: NodeJS.Timeout | undefined;
 const commentMemberRemovalTimers = new Map<string, NodeJS.Timeout>();
 const commentMemberQueues = new Map<string, Promise<void>>();
 const client = new Client({
@@ -2513,6 +2516,15 @@ client.once(Events.ClientReady, (readyClient) => {
     channelId,
     retryConfigured: Boolean(retrySourceMessageId),
   });
+  let activityIndex = 0;
+  const updateBotActivity = () => {
+    readyClient.user.setActivity(botActivityMessages[activityIndex], {
+      type: ActivityType.Playing,
+    });
+    activityIndex = (activityIndex + 1) % botActivityMessages.length;
+  };
+  updateBotActivity();
+  botActivityTimer = setInterval(updateBotActivity, 5_000);
   void validateConfiguredChannel().catch((error: unknown) => {
     writeLog("error", "channel_validation_failed", safeErrorDetails(error));
   });
@@ -2555,6 +2567,10 @@ async function shutdown(signal: string) {
   stopProfileCommand();
   stopTaskListFeature();
   stopForestLinkFeature();
+  if (botActivityTimer) {
+    clearInterval(botActivityTimer);
+    botActivityTimer = undefined;
+  }
   if (whisperExpirationCleanupTimer) {
     clearInterval(whisperExpirationCleanupTimer);
     whisperExpirationCleanupTimer = undefined;
@@ -2590,6 +2606,10 @@ void main().catch(async (error: unknown) => {
   stopProfileCommand();
   stopTaskListFeature();
   stopForestLinkFeature();
+  if (botActivityTimer) {
+    clearInterval(botActivityTimer);
+    botActivityTimer = undefined;
+  }
   client.destroy();
   await pool.end().catch(() => undefined);
   process.exitCode = 1;
