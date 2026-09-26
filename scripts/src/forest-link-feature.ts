@@ -128,7 +128,7 @@ export function parseForestTextDetails(content: string) {
     candidateDuration && candidateDuration <= 999 ? candidateDuration : null;
 
   const arabicTreeMatch = text.match(
-    /(?:نوع\s+الشجرة|الشجرة)\s*[:：-]?\s*([^\n,;.!?]+)/u,
+    /(?:نوع\s+الشجرة|الشجرة)\s*[:：-]?\s*([^\n,،;.!?]+)/u,
   );
   const englishTreeMatch = text.match(
     /\bplant\s+(?:a\s+)?\d{1,3}\s*-?\s*minutes?\s+(.+?)(?=\s+(?:with\s+(?:me|us)|you\s+can|also\s+tap|tap\s+on)\b|[.!?\n]|$)/i,
@@ -137,6 +137,7 @@ export function parseForestTextDetails(content: string) {
     arabicTreeMatch?.[1]
       ?.replace(/\s*(?:مدة الدراسة|المدة|مدة|كود الغرفة).*$/u, "")
       .replace(/\s*[⏳⌛].*$/u, "")
+      .replace(/[،,;:：| -]+$/u, "")
       .trim() ??
     englishTreeMatch?.[1]?.trim() ??
     ""
@@ -188,8 +189,8 @@ function buildPrivateDoneMessage(publicMessageUrl: string, skipped: boolean) {
   const content = [
     "## ✅ تم نشر بطاقة Forest",
     skipped
-      ? "سيظهر نوع الشجرة والمدة كـ «غير مذكور»."
-      : "تم إدراج التفاصيل التي أدخلتها، وستظهر الحقول الفارغة كـ «غير مذكور».",
+      ? "تم استخدام المعلومات المستخرجة؛ وأي حقل ناقص سيظهر «غير مذكور»."
+      : "تم إدراج التفاصيل المتاحة، وستظهر الحقول الفارغة كـ «غير مذكور».",
     `[فتح البطاقة في القناة](${publicMessageUrl})`,
   ].join("\n");
   return new ContainerBuilder()
@@ -197,7 +198,6 @@ function buildPrivateDoneMessage(publicMessageUrl: string, skipped: boolean) {
     .addTextDisplayComponents(new TextDisplayBuilder().setContent(content));
 }
 
-function makeForestDetailsModal(sourceMessageId: string) {
 function makeForestDetailsModal(
   sourceMessageId: string,
   needsTree: boolean,
@@ -489,7 +489,13 @@ async function handleForestButton(
   }
 
   if (action === "details") {
-    await interaction.showModal(makeForestDetailsModal(sourceMessageId));
+    await interaction.showModal(
+      makeForestDetailsModal(
+        sourceMessageId,
+        !submission.tree_name,
+        submission.duration_minutes === null,
+      ),
+    );
     return;
   }
   if (action !== "skip") return;
@@ -500,8 +506,8 @@ async function handleForestButton(
     pool,
     sourceMessageId,
     interaction.user.id,
-    null,
-    null,
+    submission.tree_name,
+    submission.duration_minutes,
   );
   await finishPrivatePrompt(client, submission, publicMessage, true);
 }
@@ -541,7 +547,8 @@ async function handleForestModal(
   }
 
   const treeName =
-    interaction.fields.getTextInputValue("forest_tree_name").trim() || null;
+    submission.tree_name ??
+    (interaction.fields.getTextInputValue("forest_tree_name").trim() || null);
   if (treeName && Array.from(treeName).length > 60) {
     await interaction.reply({
       content: "يجب ألا يتجاوز اسم الشجرة 60 حرفاً.",
@@ -549,17 +556,19 @@ async function handleForestModal(
     });
     return;
   }
-  const rawDuration = interaction.fields
-    .getTextInputValue("forest_duration")
-    .trim();
-  const durationMinutes = normalizeDuration(rawDuration);
-  if (durationMinutes === undefined) {
+  const rawDuration =
+    submission.duration_minutes === null
+      ? interaction.fields.getTextInputValue("forest_duration").trim()
+      : "";
+  const parsedDuration = normalizeDuration(rawDuration);
+  if (parsedDuration === undefined) {
     await interaction.reply({
       content: "اكتب المدة كرقم دقائق من 1 إلى 999، أو اتركها فارغة.",
       allowedMentions: { parse: [] },
     });
     return;
   }
+  const durationMinutes = submission.duration_minutes ?? parsedDuration;
 
   await interaction.deferReply();
   const publicMessage = await publishForestCard(
@@ -670,10 +679,12 @@ async function handleForestMessage(
     return;
   }
 
+  const details = parseForestTextDetails(message.content);
   const inserted = await pool.query(
     `INSERT INTO discord_forest_link_submissions
-       (source_message_id, guild_id, channel_id, owner_id, room_code)
-     VALUES ($1, $2, $3, $4, $5)
+       (source_message_id, guild_id, channel_id, owner_id, room_code,
+        tree_name, duration_minutes)
+     VALUES ($1, $2, $3, $4, $5, $6, $7)
      ON CONFLICT (source_message_id) DO NOTHING
      RETURNING source_message_id`,
     [
@@ -682,14 +693,35 @@ async function handleForestMessage(
       message.channelId,
       message.author.id,
       link.roomCode,
+      details.treeName,
+      details.durationMinutes,
     ],
   );
   if (inserted.rowCount !== 1) return;
 
+  if (details.treeName && details.durationMinutes) {
+    await publishForestCard(
+      client,
+      pool,
+      message.id,
+      message.author.id,
+      details.treeName,
+      details.durationMinutes,
+    );
+    return;
+  }
+
   let dmMessage: Message | null = null;
   try {
     dmMessage = await message.author.send({
-      components: [buildPrivatePrompt(message.id, link.roomCode)],
+      components: [
+        buildPrivatePrompt(
+          message.id,
+          link.roomCode,
+          details.treeName,
+          details.durationMinutes,
+        ),
+      ],
       flags: MessageFlags.IsComponentsV2,
       allowedMentions: { parse: [] },
     });
