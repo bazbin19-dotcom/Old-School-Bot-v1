@@ -193,7 +193,7 @@ async function recordBotHeartbeat(pool: Pool) {
       now.getTime() - new Date(previousHeartbeat).getTime() >
         heartbeatIntervalMs * 2
     ) {
-      await connection.query(
+      const outageDays = await connection.query<{ outage_date: string }>(
         `WITH outage AS (
            SELECT $1::timestamptz AS started_at,
                   $2::timestamptz AS ended_at
@@ -220,9 +220,20 @@ async function recordBotHeartbeat(pool: Pool) {
            AND EXTRACT(
              EPOCH FROM LEAST(ended_at, day_end) - GREATEST(started_at, day_start)
            ) >= 12 * 60 * 60
-         ON CONFLICT (outage_date) DO NOTHING`,
+         ON CONFLICT (outage_date) DO NOTHING
+         RETURNING outage_date::text AS outage_date`,
         [previousHeartbeat, now],
       );
+      if (outageDays.rows.length > 0) {
+        console.log(
+          JSON.stringify({
+            level: "info",
+            event: "daily_streak_outage_days_recorded",
+            timestamp: now.toISOString(),
+            dates: outageDays.rows.map((row) => row.outage_date),
+          }),
+        );
+      }
     }
 
     if (previousHeartbeat) {
@@ -507,6 +518,7 @@ async function updateMemberDailyRole(
   if (!guild) return;
 
   await withMemberQueue(guild.id, message.author.id, async () => {
+    await ensureBotAvailabilityInitialized(pool);
     const activityDate = baghdadDateString(message.createdAt);
     const previous = await pool.query<DailyStreakRow>(
       `SELECT streak_days, last_post_date::text AS last_post_date
@@ -518,7 +530,12 @@ async function updateMemberDailyRole(
     if (
       priorState &&
       priorState.streak_days > 0 &&
-      priorState.last_post_date < previousCalendarDate(activityDate)
+      priorState.last_post_date < previousCalendarDate(activityDate) &&
+      (await hasObservedMissedDay(
+        pool,
+        priorState.last_post_date,
+        previousCalendarDate(activityDate),
+      ))
     ) {
       await expireStaleMemberRoleInQueue(
         client,
@@ -538,10 +555,8 @@ async function updateMemberDailyRole(
          streak_days = CASE
            WHEN discord_daily_post_streaks.last_post_date = EXCLUDED.last_post_date
              THEN GREATEST(discord_daily_post_streaks.streak_days, 1)
-           WHEN discord_daily_post_streaks.last_post_date = EXCLUDED.last_post_date - 1
-             THEN discord_daily_post_streaks.streak_days + 1
            WHEN discord_daily_post_streaks.last_post_date < EXCLUDED.last_post_date
-             THEN 1
+             THEN discord_daily_post_streaks.streak_days + 1
            ELSE discord_daily_post_streaks.streak_days
          END,
          last_post_date = GREATEST(
@@ -619,7 +634,24 @@ async function archiveExpiredStreak(
        WHERE guild_id = $1
          AND user_id = $2
          AND streak_days > 0
-         AND last_post_date < $3::date
+          AND last_post_date < $3::date
+          AND EXISTS (
+            SELECT 1
+            FROM discord_daily_post_bot_heartbeat AS heartbeat
+            CROSS JOIN LATERAL generate_series(
+              GREATEST(
+                discord_daily_post_streaks.last_post_date + 1,
+                heartbeat.first_fully_observed_date
+              ),
+              $3::date,
+              interval '1 day'
+            ) AS missed_days(missed_date)
+            WHERE NOT EXISTS (
+              SELECT 1
+              FROM discord_daily_post_bot_outage_days AS outage
+              WHERE outage.outage_date = missed_days.missed_date::date
+            )
+          )
        FOR UPDATE
      )
      UPDATE discord_daily_post_streaks AS current_streak
@@ -657,8 +689,8 @@ async function expireStaleMemberRoleInQueue(
   userId: string,
   cutoffDate: string,
 ) {
-  const stillStale = await pool.query<{ streak_days: number }>(
-    `SELECT streak_days
+  const stillStale = await pool.query<DailyStreakRow>(
+    `SELECT streak_days, last_post_date::text AS last_post_date
      FROM discord_daily_post_streaks
      WHERE guild_id = $1
        AND user_id = $2
@@ -666,7 +698,13 @@ async function expireStaleMemberRoleInQueue(
        AND last_post_date < $3::date`,
     [guildId, userId, cutoffDate],
   );
-  if (!stillStale.rows[0]) return false;
+  const state = stillStale.rows[0];
+  if (
+    !state ||
+    !(await hasObservedMissedDay(pool, state.last_post_date, cutoffDate))
+  ) {
+    return false;
+  }
 
   let guild: Guild;
   try {
@@ -1075,6 +1113,7 @@ async function runStreakMaintenance(client: Client, pool: Pool) {
   if (maintenanceRunning) return;
   maintenanceRunning = true;
   try {
+    await ensureBotAvailabilityInitialized(pool);
     await removeMissedDayRoles(client, pool);
     await clearExpiredRecoveryWindows(pool).catch((error: unknown) => {
       logRoleFailure("daily_streak_recovery_expiry_cleanup_failed", error, {});
@@ -1241,6 +1280,18 @@ export async function initializeDailyPostRewardTables(pool: Pool) {
     )
   `);
   await pool.query(`
+    CREATE TABLE IF NOT EXISTS discord_daily_post_bot_heartbeat (
+      singleton boolean PRIMARY KEY DEFAULT TRUE CHECK (singleton),
+      last_seen_at timestamptz NOT NULL,
+      first_fully_observed_date date NOT NULL
+    )
+  `);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS discord_daily_post_bot_outage_days (
+      outage_date date PRIMARY KEY
+    )
+  `);
+  await pool.query(`
     CREATE INDEX IF NOT EXISTS discord_daily_post_streaks_last_post_date_idx
     ON discord_daily_post_streaks (last_post_date)
     WHERE streak_days > 0
@@ -1274,12 +1325,29 @@ export function attachDailyPostRewards(client: Client, pool: Pool) {
 
   const onReady = () => {
     if (cleanupTimer) return;
-    void validateDailyRewardAccess(client);
-    void runStreakMaintenance(client, pool);
-    cleanupTimer = setInterval(
-      () => void runStreakMaintenance(client, pool),
-      60_000,
-    );
+    void ensureBotAvailabilityInitialized(pool)
+      .then(() => {
+        void validateDailyRewardAccess(client);
+        void runStreakMaintenance(client, pool);
+      })
+      .catch((error: unknown) => {
+        logRoleFailure("daily_streak_heartbeat_failed", error, {});
+      });
+    cleanupTimer = setInterval(() => {
+      if (heartbeatRunning) return;
+      heartbeatRunning = true;
+      void (async () => {
+        try {
+          await ensureBotAvailabilityInitialized(pool);
+          await recordBotHeartbeat(pool);
+          await runStreakMaintenance(client, pool);
+        } catch (error) {
+          logRoleFailure("daily_streak_heartbeat_failed", error, {});
+        } finally {
+          heartbeatRunning = false;
+        }
+      })();
+    }, heartbeatIntervalMs);
     cleanupTimer.unref();
   };
 
