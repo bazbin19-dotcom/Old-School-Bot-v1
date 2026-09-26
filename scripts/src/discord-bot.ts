@@ -26,6 +26,7 @@ import {
   type ButtonInteraction,
   type Message,
   type ModalSubmitInteraction,
+  type ThreadChannel,
   type UserSelectMenuInteraction,
 } from "discord.js";
 import { Pool, type QueryResultRow } from "pg";
@@ -1603,7 +1604,7 @@ async function removeInactiveThreadCommenter(
 
 async function recordThreadCommentActivity(
   postMessageId: string,
-  thread: import("discord.js").ThreadChannel,
+  thread: ThreadChannel,
   userId: string,
   activityAt: Date,
   addToThread: boolean,
@@ -1629,7 +1630,8 @@ async function recordThreadCommentActivity(
 
     let memberAdded = true;
     if (addToThread) {
-      const botMember = thread.guild.members.me;
+      const botMember =
+        thread.guild.members.me ?? (await thread.guild.members.fetchMe());
       if (
         !botMember ||
         !thread
@@ -1665,8 +1667,7 @@ async function handleImageThreadComment(message: Message) {
     `SELECT message_id
      FROM discord_image_posts
      WHERE thread_id = $1
-       AND channel_id = $2
-       AND comments_locked = false`,
+       AND channel_id = $2`,
     [message.channel.id, message.channel.parentId],
   );
   const postMessageId = post.rows[0]?.message_id;
@@ -2442,6 +2443,14 @@ client.on(Events.MessageCreate, (message) => {
 });
 
 client.on(Events.MessageCreate, (message) => {
+  void handleImageThreadComment(message).catch((error: unknown) => {
+    writeLog("error", "image_thread_comment_activity_failed", {
+      ...safeErrorDetails(error),
+    });
+  });
+});
+
+client.on(Events.MessageCreate, (message) => {
   void handleFormattedTextMessage(message).catch((error: unknown) => {
     writeLog("error", "formatted_message_handler_failed", {
       ...safeErrorDetails(error),
@@ -2519,6 +2528,11 @@ client.once(Events.ClientReady, (readyClient) => {
   void recoverPendingImagePosts().catch((error: unknown) => {
     writeLog("error", "pending_image_post_recovery_failed", safeErrorDetails(error));
   });
+  void restorePendingCommentMemberRemovals().catch((error: unknown) => {
+    writeLog("error", "image_comment_member_cleanup_restore_failed", {
+      ...safeErrorDetails(error),
+    });
+  });
 });
 
 client.on(Events.Error, (error) => {
@@ -2533,6 +2547,10 @@ async function shutdown(signal: string) {
     clearInterval(whisperExpirationCleanupTimer);
     whisperExpirationCleanupTimer = undefined;
   }
+  for (const timer of commentMemberRemovalTimers.values()) {
+    clearTimeout(timer);
+  }
+  commentMemberRemovalTimers.clear();
   client.destroy();
   await pool.end();
   process.exit(0);
