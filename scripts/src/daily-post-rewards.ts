@@ -368,7 +368,11 @@ async function assignDailyRole(
   return { rewardRole, alreadyHasReward, previousRoleIds };
 }
 
-async function updateMemberDailyRole(message: Message, pool: Pool) {
+async function updateMemberDailyRole(
+  client: Client,
+  message: Message,
+  pool: Pool,
+) {
   const guild = message.guild;
   if (!guild) return;
 
@@ -469,6 +473,124 @@ async function updateMemberDailyRole(message: Message, pool: Pool) {
   });
 }
 
+async function archiveExpiredStreak(
+  pool: Pool,
+  guildId: string,
+  userId: string,
+  cutoffDate: string,
+) {
+  const archived = await pool.query<RecoveryNoticeRow>(
+    `WITH stale AS (
+       SELECT guild_id,
+              user_id,
+              ((last_post_date + 2)::timestamp AT TIME ZONE 'Asia/Baghdad') AS expired_at,
+              ((last_post_date + 4)::timestamp AT TIME ZONE 'Asia/Baghdad') AS recovery_expires_at
+       FROM discord_daily_post_streaks
+       WHERE guild_id = $1
+         AND user_id = $2
+         AND streak_days > 0
+         AND last_post_date < $3::date
+       FOR UPDATE
+     )
+     UPDATE discord_daily_post_streaks AS current_streak
+     SET streak_days = 0,
+         expired_streak_days = CASE
+           WHEN stale.recovery_expires_at > now()
+             THEN GREATEST(current_streak.expired_streak_days, current_streak.streak_days)
+           ELSE 0
+         END,
+         expired_at = CASE
+           WHEN stale.recovery_expires_at > now() THEN stale.expired_at
+           ELSE NULL
+         END,
+         recovery_expires_at = CASE
+           WHEN stale.recovery_expires_at > now() THEN stale.recovery_expires_at
+           ELSE NULL
+         END,
+         recovery_message_id = NULL,
+         updated_at = now()
+     FROM stale
+     WHERE current_streak.guild_id = stale.guild_id
+       AND current_streak.user_id = stale.user_id
+     RETURNING current_streak.expired_streak_days,
+               current_streak.recovery_expires_at,
+               current_streak.recovery_message_id`,
+    [guildId, userId, cutoffDate],
+  );
+  return archived.rows[0] ?? null;
+}
+
+async function expireStaleMemberRoleInQueue(
+  client: Client,
+  pool: Pool,
+  guildId: string,
+  userId: string,
+  cutoffDate: string,
+) {
+  const stillStale = await pool.query<{ streak_days: number }>(
+    `SELECT streak_days
+     FROM discord_daily_post_streaks
+     WHERE guild_id = $1
+       AND user_id = $2
+       AND streak_days > 0
+       AND last_post_date < $3::date`,
+    [guildId, userId, cutoffDate],
+  );
+  if (!stillStale.rows[0]) return false;
+
+  let guild: Guild;
+  try {
+    guild = await client.guilds.fetch(guildId);
+  } catch (error) {
+    if (!isDiscordErrorCode(error, 10004)) throw error;
+    await archiveExpiredStreak(pool, guildId, userId, cutoffDate);
+    return true;
+  }
+
+  let member: GuildMember | null = null;
+  try {
+    member = await guild.members.fetch(userId);
+  } catch (error) {
+    if (!isDiscordErrorCode(error, 10007)) throw error;
+  }
+
+  if (member) {
+    const mappedRoles = await pool.query<{ role_id: string }>(
+      `SELECT role_id
+       FROM discord_daily_post_roles
+       WHERE guild_id = $1`,
+      [guildId],
+    );
+    const rolesToRemove = mappedRoles.rows
+      .map((row) => row.role_id)
+      .filter((roleId) => member?.roles.cache.has(roleId));
+
+    if (rolesToRemove.length > 0) {
+      await getBotMemberWithRolePermission(guild);
+      await member.roles.remove(
+        rolesToRemove,
+        "Daily posting streak expired after a missed day",
+      );
+    }
+  }
+
+  const archived = await archiveExpiredStreak(
+    pool,
+    guildId,
+    userId,
+    cutoffDate,
+  );
+  if (archived?.expired_streak_days && archived.recovery_expires_at) {
+    await sendPendingRecoveryCardForUser(
+      client,
+      pool,
+      guildId,
+      userId,
+    );
+  }
+  return Boolean(archived);
+}
+
 async function clearStaleMemberRole(
   guildId: string,
   userId: string,
@@ -476,74 +598,277 @@ async function clearStaleMemberRole(
   client: Client,
   pool: Pool,
 ) {
-  return withMemberQueue(guildId, userId, async () => {
-    const stillStale = await pool.query<{ streak_days: number }>(
-      `SELECT streak_days
-       FROM discord_daily_post_streaks
-       WHERE guild_id = $1
-         AND user_id = $2
-         AND streak_days > 0
-         AND last_post_date < $3::date`,
-      [guildId, userId, cutoffDate],
-    );
-    if (!stillStale.rows[0]) return false;
-
-    let guild: Guild;
-    try {
-      guild = await client.guilds.fetch(guildId);
-    } catch (error) {
-      if (!isDiscordErrorCode(error, 10004)) throw error;
-      await markStreakInactive(pool, guildId, userId, cutoffDate);
-      return true;
-    }
-
-    let member: GuildMember | null = null;
-    try {
-      member = await guild.members.fetch(userId);
-    } catch (error) {
-      if (!isDiscordErrorCode(error, 10007)) throw error;
-    }
-
-    if (member) {
-      const mappedRoles = await pool.query<{ role_id: string }>(
-        `SELECT role_id
-         FROM discord_daily_post_roles
-         WHERE guild_id = $1`,
-        [guildId],
-      );
-      const rolesToRemove = mappedRoles.rows
-        .map((row) => row.role_id)
-        .filter((roleId) => member?.roles.cache.has(roleId));
-
-      if (rolesToRemove.length > 0) {
-        await getBotMemberWithRolePermission(guild);
-        await member.roles.remove(
-          rolesToRemove,
-          "Daily posting streak expired after a missed day",
-        );
-      }
-    }
-
-    await markStreakInactive(pool, guildId, userId, cutoffDate);
-    return true;
-  });
+  return withMemberQueue(guildId, userId, () =>
+    expireStaleMemberRoleInQueue(client, pool, guildId, userId, cutoffDate),
+  );
 }
 
-async function markStreakInactive(
+async function sendPendingRecoveryCardForUser(
+  client: Client,
   pool: Pool,
   guildId: string,
   userId: string,
-  cutoffDate: string,
 ) {
+  const recovery = await pool.query<RecoveryNoticeRow>(
+    `SELECT expired_streak_days, recovery_expires_at, recovery_message_id
+     FROM discord_daily_post_streaks
+     WHERE guild_id = $1 AND user_id = $2`,
+    [guildId, userId],
+  );
+  const state = recovery.rows[0];
+  if (
+    !state ||
+    state.expired_streak_days < 1 ||
+    !state.recovery_expires_at ||
+    state.recovery_message_id ||
+    state.recovery_expires_at.getTime() <= Date.now()
+  ) {
+    return false;
+  }
+
+  const channel = await getStreakNoticeChannel(client);
+  if (channel.guildId !== guildId) return false;
+  const message = await sendExpiredStreakMessage(
+    channel,
+    userId,
+    state.expired_streak_days,
+    state.recovery_expires_at,
+  );
   await pool.query(
     `UPDATE discord_daily_post_streaks
-     SET streak_days = 0, updated_at = now()
+     SET recovery_message_id = $3, updated_at = now()
      WHERE guild_id = $1
        AND user_id = $2
-       AND streak_days > 0
-       AND last_post_date < $3::date`,
-    [guildId, userId, cutoffDate],
+       AND recovery_message_id IS NULL
+       AND recovery_expires_at = $4`,
+    [guildId, userId, message.id, state.recovery_expires_at],
   );
+  return true;
+}
+
+async function sendPendingRecoveryCards(client: Client, pool: Pool) {
+  const channel = await getStreakNoticeChannel(client);
+  const pending = await pool.query<{ guild_id: string; user_id: string }>(
+    `SELECT guild_id, user_id
+     FROM discord_daily_post_streaks
+     WHERE guild_id = $1
+       AND expired_streak_days > 0
+       AND recovery_expires_at > now()
+       AND recovery_message_id IS NULL`,
+    [channel.guildId],
+  );
+
+  for (const row of pending.rows) {
+    try {
+      await withMemberQueue(row.guild_id, row.user_id, () =>
+        sendPendingRecoveryCardForUser(
+          client,
+          pool,
+          row.guild_id,
+          row.user_id,
+        ),
+      );
+    } catch (error) {
+      logRoleFailure("daily_streak_recovery_notice_failed", error, {
+        guildId: row.guild_id,
+        userId: row.user_id,
+        channelId: streakNoticeChannelId,
+      });
+    }
+  }
+}
+
+async function sendStreakReminders(
+  client: Client,
+  pool: Pool,
+  today: string,
+  kind: "three_hours" | "one_hour",
+) {
+  const channel = await getStreakNoticeChannel(client);
+  const guild = await client.guilds.fetch(channel.guildId);
+  const rows = await pool.query<{ user_id: string; streak_days: number }>(
+    `SELECT user_id, streak_days
+     FROM discord_daily_post_streaks
+     WHERE guild_id = $1
+       AND streak_days > 0
+       AND last_post_date < $2::date`,
+    [guild.id, today],
+  );
+  const noticeKind = kind === "three_hours" ? "reminder_3h" : "reminder_1h";
+
+  for (const row of rows.rows) {
+    try {
+      await withMemberQueue(guild.id, row.user_id, async () => {
+        const current = await pool.query<DailyStreakRow>(
+          `SELECT streak_days, last_post_date::text AS last_post_date
+           FROM discord_daily_post_streaks
+           WHERE guild_id = $1 AND user_id = $2`,
+          [guild.id, row.user_id],
+        );
+        const currentState = current.rows[0];
+        if (
+          !currentState ||
+          currentState.streak_days < 1 ||
+          currentState.last_post_date >= today
+        ) {
+          return;
+        }
+        await guild.members.fetch(row.user_id);
+        await sendStreakNoticeOnce(
+          pool,
+          guild.id,
+          row.user_id,
+          today,
+          noticeKind,
+          () =>
+            sendStreakReminderMessage(
+              channel,
+              row.user_id,
+              currentState.streak_days,
+              kind,
+            ),
+        );
+      });
+    } catch (error) {
+      if (isDiscordErrorCode(error, 10007)) continue;
+      logRoleFailure("daily_streak_reminder_failed", error, {
+        guildId: guild.id,
+        userId: row.user_id,
+        channelId: streakNoticeChannelId,
+        reminder: kind,
+      });
+    }
+  }
+}
+
+async function handleStreakRecovery(
+  client: Client,
+  pool: Pool,
+  interaction: ButtonInteraction,
+) {
+  const [prefix, action, ownerId] = interaction.customId.split(":");
+  if (
+    prefix !== "streak" ||
+    action !== "recover" ||
+    !ownerId ||
+    !/^\d{17,20}$/.test(ownerId)
+  ) {
+    return;
+  }
+
+  if (
+    interaction.channelId !== streakNoticeChannelId ||
+    !interaction.guildId ||
+    interaction.message.author.id !== client.user?.id
+  ) {
+    await interaction.reply({
+      content: "رسالة استرداد الستريك هذه لم تعد متاحة.",
+      ephemeral: true,
+      allowedMentions: { parse: [] },
+    });
+    return;
+  }
+  if (interaction.user.id !== ownerId) {
+    await interaction.reply({
+      content: "زر الاسترداد متاح لصاحب الستريك فقط.",
+      ephemeral: true,
+      allowedMentions: { parse: [] },
+    });
+    return;
+  }
+
+  await interaction.deferReply({ ephemeral: true });
+  await withMemberQueue(interaction.guildId, ownerId, async () => {
+    const result = await pool.query<RecoveryStateRow>(
+      `SELECT streak_days,
+              last_post_date::text AS last_post_date,
+              expired_streak_days,
+              recovery_expires_at,
+              recovery_message_id
+       FROM discord_daily_post_streaks
+       WHERE guild_id = $1 AND user_id = $2`,
+      [interaction.guildId, ownerId],
+    );
+    const state = result.rows[0];
+    if (
+      !state ||
+      state.recovery_message_id !== interaction.message.id ||
+      state.expired_streak_days < 1 ||
+      !state.recovery_expires_at ||
+      state.recovery_expires_at.getTime() <= Date.now()
+    ) {
+      await interaction.editReply(
+        "انتهت مهلة الاسترداد أو تم استخدام هذا الزر من قبل.",
+      );
+      return;
+    }
+
+    const activityDate = baghdadDateString(new Date());
+    const restored = await pool.query<{ streak_days: number }>(
+      `UPDATE discord_daily_post_streaks
+       SET streak_days = expired_streak_days,
+           last_post_date = $4::date,
+           expired_streak_days = 0,
+           expired_at = NULL,
+           recovery_expires_at = NULL,
+           recovery_message_id = NULL,
+           updated_at = now()
+       WHERE guild_id = $1
+         AND user_id = $2
+         AND recovery_message_id = $3
+         AND expired_streak_days > 0
+         AND recovery_expires_at > now()
+       RETURNING streak_days`,
+      [
+        interaction.guildId,
+        ownerId,
+        interaction.message.id,
+        activityDate,
+      ],
+    );
+    const restoredDays = restored.rows[0]?.streak_days;
+    if (!restoredDays) {
+      await interaction.editReply(
+        "تعذر تأكيد الاسترداد؛ ربما انتهت المهلة. حاول تحديث الستريك بالنشر.",
+      );
+      return;
+    }
+
+    try {
+      const guild = await client.guilds.fetch(interaction.guildId!);
+      const member = await guild.members.fetch(ownerId);
+      await assignDailyRole(guild, pool, member, restoredDays);
+    } catch (error) {
+      await pool.query(
+        `UPDATE discord_daily_post_streaks
+         SET streak_days = $4,
+             last_post_date = $5::date,
+             expired_streak_days = $6,
+             expired_at = (($5::date + 2)::timestamp AT TIME ZONE 'Asia/Baghdad'),
+             recovery_expires_at = $7,
+             recovery_message_id = $3,
+             updated_at = now()
+         WHERE guild_id = $1
+           AND user_id = $2
+           AND recovery_message_id IS NULL
+           AND expired_streak_days = 0`,
+        [
+          interaction.guildId,
+          ownerId,
+          interaction.message.id,
+          state.streak_days,
+          state.last_post_date,
+          state.expired_streak_days,
+          new Date(state.recovery_expires_at),
+        ],
+      );
+      throw error;
+    }
+
+    await interaction.editReply(
+      `تم استرداد ستريكك إلى **${restoredDays} 🔥**. تم تسجيل اليوم كتجديد؛ انشر غداً للمحافظة عليه.`,
+    );
+  });
 }
 
 async function removeMissedDayRoles(client: Client, pool: Pool) {
@@ -603,9 +928,60 @@ async function removeMissedDayRoles(client: Client, pool: Pool) {
   }
 }
 
+async function clearExpiredRecoveryWindows(pool: Pool) {
+  await pool.query(
+    `UPDATE discord_daily_post_streaks
+     SET expired_streak_days = 0,
+         expired_at = NULL,
+         recovery_expires_at = NULL,
+         recovery_message_id = NULL,
+         updated_at = now()
+     WHERE expired_streak_days > 0
+       AND recovery_expires_at <= now()`,
+  );
+}
+
+async function runStreakMaintenance(client: Client, pool: Pool) {
+  if (maintenanceRunning) return;
+  maintenanceRunning = true;
+  try {
+    await removeMissedDayRoles(client, pool);
+    await clearExpiredRecoveryWindows(pool).catch((error: unknown) => {
+      logRoleFailure("daily_streak_recovery_expiry_cleanup_failed", error, {});
+    });
+    await sendPendingRecoveryCards(client, pool).catch((error: unknown) => {
+      logRoleFailure("daily_streak_pending_recovery_delivery_failed", error, {
+        channelId: streakNoticeChannelId,
+      });
+    });
+
+    const localTime = baghdadClock(new Date());
+    if (localTime.hour === 21 && localTime.minute <= 1) {
+      await sendStreakReminders(client, pool, localTime.date, "three_hours");
+    } else if (localTime.hour === 23 && localTime.minute <= 1) {
+      await sendStreakReminders(client, pool, localTime.date, "one_hour");
+    }
+
+    if (lastNoticePruneDate !== localTime.date) {
+      await pool.query(
+        `DELETE FROM discord_daily_post_notices
+         WHERE notice_date < $1::date - 45`,
+        [localTime.date],
+      );
+      lastNoticePruneDate = localTime.date;
+    }
+  } catch (error) {
+    logRoleFailure("daily_streak_maintenance_failed", error, {
+      channelId: streakNoticeChannelId,
+    });
+  } finally {
+    maintenanceRunning = false;
+  }
+}
+
 async function validateDailyRewardAccess(client: Client) {
   const channels = await Promise.all(
-    [...rewardChannelIds].map(async (channelId) => {
+    [...rewardChannelIds, streakNoticeChannelId].map(async (channelId) => {
       try {
         const channel = await client.channels.fetch(channelId);
         const guildId =
@@ -662,6 +1038,40 @@ async function validateDailyRewardAccess(client: Client) {
       });
     }
   }
+
+  try {
+    const noticeChannel = await getStreakNoticeChannel(client);
+    const guild = await client.guilds.fetch(noticeChannel.guildId);
+    const botMember = guild.members.me ?? (await guild.members.fetchMe());
+    const permissions = noticeChannel.permissionsFor(botMember);
+    const requiredPermissions = [
+      PermissionFlagsBits.ViewChannel,
+      PermissionFlagsBits.SendMessages,
+      PermissionFlagsBits.EmbedLinks,
+      PermissionFlagsBits.AttachFiles,
+    ];
+    if (
+      !permissions ||
+      requiredPermissions.some((permission) => !permissions.has(permission))
+    ) {
+      throw new Error(
+        "The bot needs View Channel, Send Messages, Embed Links, and Attach Files in the streak-notice channel.",
+      );
+    }
+    console.log(
+      JSON.stringify({
+        level: "info",
+        event: "daily_streak_notice_permissions_ready",
+        timestamp: new Date().toISOString(),
+        guildId: guild.id,
+        channelId: noticeChannel.id,
+      }),
+    );
+  } catch (error) {
+    logRoleFailure("daily_streak_notice_permission_check_failed", error, {
+      channelId: streakNoticeChannelId,
+    });
+  }
 }
 
 export async function initializeDailyPostRewardTables(pool: Pool) {
@@ -676,6 +1086,13 @@ export async function initializeDailyPostRewardTables(pool: Pool) {
     )
   `);
   await pool.query(`
+    ALTER TABLE discord_daily_post_streaks
+      ADD COLUMN IF NOT EXISTS expired_streak_days integer NOT NULL DEFAULT 0,
+      ADD COLUMN IF NOT EXISTS expired_at timestamptz,
+      ADD COLUMN IF NOT EXISTS recovery_expires_at timestamptz,
+      ADD COLUMN IF NOT EXISTS recovery_message_id text
+  `);
+  await pool.query(`
     CREATE TABLE IF NOT EXISTS discord_daily_post_roles (
       guild_id text NOT NULL,
       streak_days integer NOT NULL,
@@ -684,9 +1101,24 @@ export async function initializeDailyPostRewardTables(pool: Pool) {
     )
   `);
   await pool.query(`
+    CREATE TABLE IF NOT EXISTS discord_daily_post_notices (
+      guild_id text NOT NULL,
+      user_id text NOT NULL,
+      notice_date date NOT NULL,
+      notice_type text NOT NULL,
+      created_at timestamptz NOT NULL DEFAULT now(),
+      PRIMARY KEY (guild_id, user_id, notice_date, notice_type)
+    )
+  `);
+  await pool.query(`
     CREATE INDEX IF NOT EXISTS discord_daily_post_streaks_last_post_date_idx
     ON discord_daily_post_streaks (last_post_date)
     WHERE streak_days > 0
+  `);
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS discord_daily_post_streaks_recovery_expiry_idx
+    ON discord_daily_post_streaks (recovery_expires_at)
+    WHERE expired_streak_days > 0
   `);
 }
 
@@ -701,7 +1133,7 @@ export function attachDailyPostRewards(client: Client, pool: Pool) {
       return;
     }
 
-    void updateMemberDailyRole(message, pool).catch((error: unknown) => {
+    void updateMemberDailyRole(client, message, pool).catch((error: unknown) => {
       logRoleFailure("daily_post_role_update_failed", error, {
         guildId: message.guildId ?? "unknown",
         userId: message.author.id,
@@ -713,19 +1145,49 @@ export function attachDailyPostRewards(client: Client, pool: Pool) {
   const onReady = () => {
     if (cleanupTimer) return;
     void validateDailyRewardAccess(client);
-    void removeMissedDayRoles(client, pool);
+    void runStreakMaintenance(client, pool);
     cleanupTimer = setInterval(
-      () => void removeMissedDayRoles(client, pool),
+      () => void runStreakMaintenance(client, pool),
       60_000,
     );
     cleanupTimer.unref();
   };
 
+  const onInteraction = (interaction: Interaction) => {
+    if (
+      !interaction.isButton() ||
+      !interaction.customId.startsWith("streak:recover:")
+    ) {
+      return;
+    }
+
+    void handleStreakRecovery(client, pool, interaction).catch(
+      async (error: unknown) => {
+        logRoleFailure("daily_streak_recovery_failed", error, {
+          channelId: interaction.channelId ?? "unknown",
+          userId: interaction.user.id,
+        });
+        const response = {
+          content: "تعذر استرداد الستريك الآن. حاول مرة أخرى بعد قليل.",
+        };
+        if (interaction.deferred) {
+          await interaction.editReply(response).catch(() => null);
+        } else if (interaction.replied) {
+          await interaction.followUp({ ...response, ephemeral: true }).catch(() => null);
+        } else {
+          await interaction.reply({ ...response, ephemeral: true }).catch(() => null);
+        }
+      },
+    );
+  };
+
   client.on(Events.MessageCreate, onMessage);
+  client.on(Events.InteractionCreate, onInteraction);
   client.once(Events.ClientReady, onReady);
 
   return () => {
     client.off(Events.MessageCreate, onMessage);
+    client.off(Events.InteractionCreate, onInteraction);
     client.off(Events.ClientReady, onReady);
     if (cleanupTimer) {
       clearInterval(cleanupTimer);

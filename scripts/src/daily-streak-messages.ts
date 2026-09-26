@@ -112,7 +112,7 @@ export async function sendExpiredStreakMessage(
     .setEmoji("🔥")
     .setLabel("استرداد الستريك")
     .setStyle(ButtonStyle.Primary);
-  const container = new ContainerBuilder()
+  const firstPanel = new ContainerBuilder()
     .setAccentColor(0x91999f)
     .addTextDisplayComponents(
       new TextDisplayBuilder().setContent(
@@ -123,12 +123,9 @@ export async function sendExpiredStreakMessage(
       new MediaGalleryBuilder().addItems({
         media: { url: `attachment://${fileName}` },
       }),
-    )
-    .addSeparatorComponents(
-      new SeparatorBuilder()
-        .setDivider(true)
-        .setSpacing(SeparatorSpacingSize.Small),
-    )
+    );
+  const recoveryPanel = new ContainerBuilder()
+    .setAccentColor(0x91999f)
     .addTextDisplayComponents(
       new TextDisplayBuilder().setContent(
         `### لديك فرصة للاسترداد\nيمكنك استعادة **${streakDays} 🔥** خلال يومين، حتى **${formattedDeadline}** بتوقيت بغداد. بعد انتهاء المهلة، ستبدأ من ١ عند نشرك التالي.`,
@@ -139,7 +136,13 @@ export async function sendExpiredStreakMessage(
     );
 
   return channel.send({
-    components: [container],
+    components: [
+      firstPanel,
+      new SeparatorBuilder()
+        .setDivider(true)
+        .setSpacing(SeparatorSpacingSize.Small),
+      recoveryPanel,
+    ],
     flags: MessageFlags.IsComponentsV2,
     files: [createAttachment("expired", image)],
     allowedMentions: { users: [userId], parse: [] },
