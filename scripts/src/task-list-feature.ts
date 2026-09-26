@@ -20,7 +20,6 @@ import {
   type Message,
   type ModalSubmitInteraction,
   type StringSelectMenuInteraction,
-  type TextChannel,
 } from "discord.js";
 import type { Pool } from "pg";
 
@@ -118,6 +117,7 @@ function relativeTime(createdAt: Date | string) {
 
 function buildTaskListContainer(
   list: TaskListRow & { tasks: TaskItem[] },
+  includeControls = true,
 ) {
   const completed = list.tasks.filter((task) => task.done).length;
   const percent =
@@ -153,7 +153,7 @@ function buildTaskListContainer(
     )
     .addTextDisplayComponents(new TextDisplayBuilder().setContent(taskText));
 
-  if (list.tasks.length > 0) {
+  if (includeControls && list.tasks.length > 0) {
     const taskMenu = new StringSelectMenuBuilder()
       .setCustomId(`tasklist:toggle:${list.message_id}`)
       .setPlaceholder("اختر مهمة لتحديث حالتها")
@@ -171,8 +171,8 @@ function buildTaskListContainer(
     );
   }
 
-  container
-    .addActionRowComponents(
+  if (includeControls) {
+    container.addActionRowComponents(
       new ActionRowBuilder<ButtonBuilder>().addComponents(
         new ButtonBuilder()
           .setCustomId(`tasklist:add:${list.message_id}`)
@@ -185,7 +185,9 @@ function buildTaskListContainer(
           .setEmoji("✏️")
           .setStyle(ButtonStyle.Secondary),
       ),
-    )
+    );
+  }
+  container
     .addSeparatorComponents(
       new SeparatorBuilder()
         .setDivider(true)
@@ -408,12 +410,13 @@ async function handleTaskListMessage(
   };
 
   const botMessage = await channel.send({
-    components: [buildTaskListContainer(placeholderList)],
+    components: [buildTaskListContainer(placeholderList, false)],
     flags: MessageFlags.IsComponentsV2,
     allowedMentions: { parse: [] },
   });
   const list = { ...placeholderList, message_id: botMessage.id };
 
+  let rowInserted = false;
   try {
     await pool.query(
       `INSERT INTO discord_task_lists
@@ -429,11 +432,19 @@ async function handleTaskListMessage(
         source.createdAt,
       ],
     );
+    rowInserted = true;
     await botMessage.edit({
       components: [buildTaskListContainer(list)],
       allowedMentions: { parse: [] },
     });
   } catch (error) {
+    if (rowInserted) {
+      await pool
+        .query("DELETE FROM discord_task_lists WHERE message_id = $1", [
+          botMessage.id,
+        ])
+        .catch(() => undefined);
+    }
     await botMessage.delete().catch(() => undefined);
     throw error;
   }
@@ -683,20 +694,10 @@ async function handleTaskListInteraction(
       interaction.isStringSelectMenu() ||
       interaction.isModalSubmit()
     ) {
-      if (!interaction.replied && !interaction.deferred) {
-        await replyPrivately(
-          interaction,
-          "تعذر تحديث القائمة حالياً. حاول مرة أخرى بعد قليل.",
-        ).catch(() => undefined);
-      } else if (interaction.isModalSubmit()) {
-        await interaction
-          .followUp({
-            content: "تعذر تحديث القائمة حالياً. حاول مرة أخرى بعد قليل.",
-            ephemeral: true,
-            allowedMentions: { parse: [] },
-          })
-          .catch(() => undefined);
-      }
+      await replyPrivately(
+        interaction,
+        "تعذر تحديث القائمة حالياً. حاول مرة أخرى بعد قليل.",
+      ).catch(() => undefined);
     }
   }
 }
@@ -722,8 +723,7 @@ export function attachTaskListFeature(client: Client, pool: Pool) {
       logTaskListError("task_list_message_failed", error);
       if (
         message.channelId === taskListChannelId &&
-        !message.author.bot &&
-        !message.deleted
+        !message.author.bot
       ) {
         void message
           .reply({
