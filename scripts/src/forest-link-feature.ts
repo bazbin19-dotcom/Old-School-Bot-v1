@@ -126,25 +126,71 @@ export function parseForestTextDetails(content: string) {
   const candidateDuration = durationMatch ? Number(durationMatch[1]) : null;
   const durationMinutes =
     candidateDuration && candidateDuration <= 999 ? candidateDuration : null;
+  const durationEnd =
+    durationMatch?.index === undefined
+      ? null
+      : durationMatch.index + durationMatch[0].length;
 
   const arabicTreeMatch = text.match(
-    /(?:نوع\s+الشجرة|الشجرة)\s*[:：-]?\s*([^\n,،;.!?]+)/u,
+    /(?:نوع\s+الشجرة|الشجرة|شجرة)\s*[:：-]?\s*([^\n,،;.!?]+)/u,
   );
   const englishTreeMatch = text.match(
     /\bplant\s+(?:a\s+)?\d{1,3}\s*-?\s*minutes?\s+(.+?)(?=\s+(?:with\s+(?:me|us)|you\s+can|also\s+tap|tap\s+on)\b|[.!?\n]|$)/i,
   );
-  const treeName = (
-    arabicTreeMatch?.[1]
-      ?.replace(/\s*(?:مدة الدراسة|المدة|مدة|كود الغرفة).*$/u, "")
+  const labelledEnglishTreeMatch = text.match(
+    /\b(?:tree(?:\s+type)?|plant)\s*[:：=-]\s*([^\n,،;.!?]+)/i,
+  );
+  const beforeDuration =
+    durationMatch?.index === undefined
+      ? ""
+      : text.slice(0, durationMatch.index);
+  const englishBeforeDurationMatch = beforeDuration.match(
+    /\b(?:plant|planting|grow|growing)\s+(?:a\s+)?(.+?)\s+(?:for|during)\s*$/i,
+  );
+  const arabicBeforeDurationMatch = beforeDuration.match(
+    /(?:ازرع|أزرع|نزرع|لنزرع|زرع)\s+(?:شجرة\s+)?(.+?)(?=\s*(?:لمدة|مدة)\s*$|$)/u,
+  );
+  const afterDuration =
+    durationEnd === null ? "" : text.slice(durationEnd);
+  const afterDurationCandidate = afterDuration
+    .split(
+      /(?:\s+(?:with\s+(?:me|us)|you\s+can|also\s+tap|tap\s+on|to\s+join|join\s+me|in\s+forest|to\s+study)\b|[.!?\n;])/i,
+    )[0]
+    ?.trim();
+
+  const cleanTreeName = (value: string | undefined) => {
+    if (!value) return null;
+    const cleaned = value
+      .replace(/^[\s:;,.!?|•،-]+/u, "")
+      .replace(/^(?:(?:and\s+)?(?:to\s+)?(?:plant|planting|grow|growing)|and)\s+/i, "")
+      .replace(/^(?:with|of|for|as|is|the|its|نوعها|اسمها)\s+/iu, "")
+      .replace(/^(?:a|an|the)\s+/i, "")
+      .replace(/\s+(?:مدة الدراسة|المدة|لمدة|مدة|كود الغرفة).*$/u, "")
       .replace(/\s*[⏳⌛].*$/u, "")
-      .replace(/[،,;:：| -]+$/u, "")
-      .trim() ??
-    englishTreeMatch?.[1]?.trim() ??
-    ""
-  ).slice(0, 60);
+      .replace(/\s+(?:tree|plant)$/i, "")
+      .replace(/[،,;:：| -.!?]+$/u, "")
+      .trim();
+    if (
+      !cleaned ||
+      /^(?:me|us|with me|with us|together|focus|study|session|forest|room)$/i.test(
+        cleaned,
+      )
+    ) {
+      return null;
+    }
+    return cleaned.slice(0, 60);
+  };
+
+  const treeName =
+    cleanTreeName(arabicTreeMatch?.[1]) ??
+    cleanTreeName(englishTreeMatch?.[1]) ??
+    cleanTreeName(labelledEnglishTreeMatch?.[1]) ??
+    cleanTreeName(englishBeforeDurationMatch?.[1]) ??
+    cleanTreeName(arabicBeforeDurationMatch?.[1]) ??
+    cleanTreeName(afterDurationCandidate);
 
   return {
-    treeName: treeName || null,
+    treeName,
     durationMinutes,
   };
 }

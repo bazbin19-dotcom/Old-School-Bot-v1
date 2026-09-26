@@ -1,3 +1,4 @@
 - [Discord ephemeral button interactions](discord-ephemeral-controls.md) — ephemeral controls identify their reply message, so validate sub-actions by channel and stored post ID.
 - [Discord V2 attachments](discord-v2-attachments.md) — preserve existing attachment IDs on message edits or later interactions cannot find the images.
 - [Repositioning Discord messages](discord-message-reposition.md) — Discord cannot move an existing message; replace the bot panel and update its stored ID, leaving one copy.
+- [Forest invite parsing](forest-invite-parsing.md) — tree names may appear in different positions; avoid relying on one fixed invite sentence pattern.
