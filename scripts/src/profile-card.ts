@@ -90,6 +90,34 @@ async function resizeImage(url: string, width: number, height: number) {
   return `data:image/jpeg;base64,${resized.toString("base64")}`;
 }
 
+async function resizeOptionalImage(
+  url: string,
+  width: number,
+  height: number,
+  kind: "banner" | "post",
+) {
+  try {
+    return await resizeImage(url, width, height);
+  } catch (error) {
+    const message =
+      error instanceof Error
+        ? error.message
+            .replace(/https?:\/\/\S+/gi, "[url]")
+            .replace(/\b\d{17,20}\b/g, "[id]")
+            .slice(0, 180)
+        : "Unknown image error";
+    process.stderr.write(
+      `${JSON.stringify({
+        level: "warn",
+        event: "profile_optional_image_unavailable",
+        kind,
+        errorMessage: message,
+      })}\n`,
+    );
+    return null;
+  }
+}
+
 async function mapWithConcurrency<T, R>(
   items: T[],
   concurrency: number,
@@ -252,10 +280,12 @@ function buildSvg(
 export async function renderProfileCard(input: ProfileCardInput) {
   const [avatarData, bannerData, postImages] = await Promise.all([
     resizeImage(input.avatarUrl, 600, 600),
-    input.bannerUrl ? resizeImage(input.bannerUrl, 1600, 540) : Promise.resolve(null),
+    input.bannerUrl
+      ? resizeOptionalImage(input.bannerUrl, 1600, 540, "banner")
+      : Promise.resolve(null),
     mapWithConcurrency(input.posts, 3, async (post) => ({
       imageData: post.imageUrl
-        ? await resizeImage(post.imageUrl, 520, 510)
+        ? await resizeOptionalImage(post.imageUrl, 520, 510, "post")
         : null,
       likeCount: post.likeCount,
     })),

@@ -105,8 +105,21 @@ function logProfileError(
 ) {
   const info =
     error && typeof error === "object"
-      ? (error as { name?: unknown; code?: unknown })
+      ? (error as {
+          name?: unknown;
+          code?: unknown;
+          status?: unknown;
+          message?: unknown;
+        })
       : {};
+  const errorMessage =
+    typeof info.message === "string"
+      ? info.message
+          .replace(/\bpostgres(?:ql)?:\/\/\S+/gi, "[redacted connection]")
+          .replace(/https?:\/\/\S+/gi, "[url]")
+          .replace(/\b\d{17,20}\b/g, "[id]")
+          .slice(0, 180)
+      : undefined;
   process.stderr.write(
     `${JSON.stringify({
       level: "error",
@@ -115,6 +128,8 @@ function logProfileError(
       ...details,
       errorName: typeof info.name === "string" ? info.name : "Error",
       ...(info.code !== undefined ? { errorCode: String(info.code) } : {}),
+      ...(typeof info.status === "number" ? { errorStatus: info.status } : {}),
+      ...(errorMessage ? { errorMessage } : {}),
     })}\n`,
   );
 }
@@ -892,8 +907,20 @@ export function attachProfileCommand(client: Client, pool: Pool) {
 
     if (!action) return;
     void action.catch(async (error: unknown) => {
+      const customId =
+        interaction.isButton() ||
+        interaction.isStringSelectMenu() ||
+        interaction.isModalSubmit()
+          ? interaction.customId
+          : "";
       logProfileError(eventName, error, {
         channelId: interaction.channelId ?? "unknown",
+        interactionType: interaction.isButton()
+          ? "button"
+          : interaction.isStringSelectMenu()
+            ? "select"
+            : "modal",
+        action: customId.split(":")[1] ?? "unknown",
       });
       if (
         interaction.isButton() ||
