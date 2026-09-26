@@ -11,6 +11,7 @@ import {
   MediaGalleryBuilder,
   MessageFlags,
   ModalBuilder,
+  PermissionFlagsBits,
   SectionBuilder,
   SeparatorBuilder,
   SeparatorSpacingSize,
@@ -138,10 +139,14 @@ function buildPrivatePrompt(sourceMessageId: string, roomCode: string) {
     .addActionRowComponents(buttons);
 }
 
-function buildPrivateDoneMessage(publicMessageUrl?: string) {
-  const content = publicMessageUrl
-    ? `## ✅ تم نشر بطاقة Forest\n[فتح البطاقة في القناة](${publicMessageUrl})`
-    : "## ✅ تم تجهيز البطاقة\nسيظهر نوع الشجرة والمدة كـ «غير مذكور».";
+function buildPrivateDoneMessage(publicMessageUrl: string, skipped: boolean) {
+  const content = [
+    "## ✅ تم نشر بطاقة Forest",
+    skipped
+      ? "سيظهر نوع الشجرة والمدة كـ «غير مذكور»."
+      : "تم إدراج التفاصيل التي أدخلتها، وستظهر الحقول الفارغة كـ «غير مذكور».",
+    `[فتح البطاقة في القناة](${publicMessageUrl})`,
+  ].join("\n");
   return new ContainerBuilder()
     .setAccentColor(0x57a663)
     .addTextDisplayComponents(new TextDisplayBuilder().setContent(content));
@@ -223,6 +228,17 @@ async function fetchSubmissionDmMessage(
   const user = await client.users.fetch(submission.owner_id);
   const dm = await user.createDM();
   return dm.messages.fetch(submission.dm_message_id).catch(() => null);
+}
+
+async function deleteForestSourceMessage(
+  channel: TextChannel,
+  sourceMessageId: string,
+) {
+  const source = await channel.messages.fetch(sourceMessageId).catch(() => null);
+  if (!source) return;
+  await source.delete().catch((error: unknown) => {
+    logForestError("forest_source_message_delete_failed", error);
+  });
 }
 
 function buildForestCard(
@@ -316,7 +332,10 @@ async function publishForestCard(
       const message = await channel.messages
         .fetch(submission.public_message_id)
         .catch(() => null);
-      if (message) return message;
+      if (message) {
+        await deleteForestSourceMessage(channel, sourceMessageId);
+        return message;
+      }
       throw new Error("The Forest card could not be found.");
     }
 
@@ -368,6 +387,7 @@ async function publishForestCard(
       await card.delete().catch(() => undefined);
       throw error;
     }
+    await deleteForestSourceMessage(channel, sourceMessageId);
     return card;
   });
 }
@@ -381,11 +401,7 @@ async function finishPrivatePrompt(
   const dmMessage = await fetchSubmissionDmMessage(client, submission);
   if (!dmMessage) return;
   await dmMessage.edit({
-    components: [
-      buildPrivateDoneMessage(
-        skipped ? undefined : publicMessage.url,
-      ),
-    ],
+    components: [buildPrivateDoneMessage(publicMessage.url, skipped)],
     allowedMentions: { parse: [] },
   });
 }
@@ -570,6 +586,37 @@ async function handleForestMessage(
   const link = parseForestJoinLink(message.content);
   if (!link) return;
 
+  const channel = await client.channels.fetch(forestLinkChannelId);
+  if (!channel || channel.type !== ChannelType.GuildText) return;
+  const botMember = channel.guild.members.me;
+  const permissions = botMember ? channel.permissionsFor(botMember) : null;
+  const requiredPermissions = [
+    [PermissionFlagsBits.SendMessages, "إرسال الرسائل"],
+    [PermissionFlagsBits.AttachFiles, "إرفاق الصور"],
+    [PermissionFlagsBits.ManageMessages, "حذف الرسالة الأصلية"],
+  ] as const;
+  const missingPermissions = requiredPermissions
+    .filter(([permission]) => !permissions?.has(permission))
+    .map(([, name]) => name);
+  if (missingPermissions.length > 0) {
+    process.stderr.write(
+      `${JSON.stringify({
+        level: "warn",
+        event: "forest_channel_permissions_missing",
+        timestamp: new Date().toISOString(),
+        channelId: forestLinkChannelId,
+        missingPermissions,
+      })}\n`,
+    );
+    if (permissions?.has(PermissionFlagsBits.SendMessages)) {
+      await message.reply({
+        content: `لا أستطيع تجهيز البطاقة قبل منحي صلاحيات: ${missingPermissions.join("، ")}.`,
+        allowedMentions: { parse: [], repliedUser: false },
+      });
+    }
+    return;
+  }
+
   const inserted = await pool.query(
     `INSERT INTO discord_forest_link_submissions
        (source_message_id, guild_id, channel_id, owner_id, room_code)
@@ -586,7 +633,7 @@ async function handleForestMessage(
   );
   if (inserted.rowCount !== 1) return;
 
-  let dmMessage: Message;
+  let dmMessage: Message | null = null;
   try {
     dmMessage = await message.author.send({
       components: [buildPrivatePrompt(message.id, link.roomCode)],
@@ -600,6 +647,9 @@ async function handleForestMessage(
       [message.id, dmMessage.id],
     );
   } catch (error) {
+    if (dmMessage) {
+      await dmMessage.delete().catch(() => undefined);
+    }
     await pool
       .query(
         "DELETE FROM discord_forest_link_submissions WHERE source_message_id = $1",
@@ -617,10 +667,6 @@ async function handleForestMessage(
     return;
   }
 
-  await message.delete().catch((error: unknown) => {
-    logForestError("forest_source_message_delete_failed", error);
-  });
-  void dmMessage;
 }
 
 async function validateForestChannel(client: Client) {
