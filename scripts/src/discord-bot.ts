@@ -39,6 +39,10 @@ import {
   initializeProfileTables,
 } from "./profile-command.js";
 import {
+  attachTaskListFeature,
+  initializeTaskListTables,
+} from "./task-list-feature.js";
+import {
   profileImagePostChannelId,
   profileXpPerPost,
 } from "./profile-store.js";
@@ -64,6 +68,7 @@ const commentRemovalRetryMs = 60_000;
 const pool = new Pool({ connectionString: databaseUrl });
 let stopDailyPostRewards = () => {};
 let stopProfileCommand = () => {};
+let stopTaskListFeature = () => {};
 const commentMemberRemovalTimers = new Map<string, NodeJS.Timeout>();
 const commentMemberQueues = new Map<string, Promise<void>>();
 const client = new Client({
@@ -2543,6 +2548,7 @@ async function shutdown(signal: string) {
   writeLog("info", "shutdown_started", { signal });
   stopDailyPostRewards();
   stopProfileCommand();
+  stopTaskListFeature();
   if (whisperExpirationCleanupTimer) {
     clearInterval(whisperExpirationCleanupTimer);
     whisperExpirationCleanupTimer = undefined;
@@ -2563,8 +2569,10 @@ async function main() {
   await initializeDatabase();
   await initializeDailyPostRewardTables(pool);
   await initializeProfileTables(pool);
+  await initializeTaskListTables(pool);
   stopDailyPostRewards = attachDailyPostRewards(client, pool);
   stopProfileCommand = attachProfileCommand(client, pool);
+  stopTaskListFeature = attachTaskListFeature(client, pool);
   await client.login(token);
 }
 
@@ -2572,6 +2580,7 @@ void main().catch(async (error: unknown) => {
   writeLog("error", "startup_failed", safeErrorDetails(error));
   stopDailyPostRewards();
   stopProfileCommand();
+  stopTaskListFeature();
   client.destroy();
   await pool.end().catch(() => undefined);
   process.exitCode = 1;
