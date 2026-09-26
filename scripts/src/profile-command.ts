@@ -362,25 +362,32 @@ async function replaceProfileImage(
   image: Buffer,
 ) {
   const fileName = createProfileFileName(view.ownerId);
-  const existingAttachments = [...message.attachments.values()].map(
+  const currentMessage = await message.fetch(true);
+  const existingAttachments = [...currentMessage.attachments.values()].map(
     (attachment) => ({ id: attachment.id }),
   );
-  const uploadedMessage = await message.edit({
+  let uploadedMessage = await currentMessage.edit({
     files: [new AttachmentBuilder(image, { name: fileName })],
     ...(existingAttachments.length > 0
       ? { attachments: existingAttachments }
       : {}),
   });
 
-  let newAttachment = uploadedMessage.attachments.find(
-    (attachment) => attachment.name === fileName,
-  );
+  const findUploadedAttachment = (candidate: Message) =>
+    candidate.attachments.find((attachment) => attachment.name === fileName) ??
+    [...candidate.attachments.values()].find(
+      (attachment) =>
+        !existingAttachments.some((existing) => existing.id === attachment.id),
+    );
+  let newAttachment = findUploadedAttachment(uploadedMessage);
   if (!newAttachment) {
-    const attachments = [...uploadedMessage.attachments.values()];
-    newAttachment = attachments[attachments.length - 1];
+    uploadedMessage = await uploadedMessage.fetch(true);
+    newAttachment = findUploadedAttachment(uploadedMessage);
   }
   if (!newAttachment) {
-    throw new Error("The updated profile image attachment was not returned.");
+    throw new Error(
+      "The updated profile image attachment was missing after refreshing the message.",
+    );
   }
 
   await uploadedMessage.edit({
