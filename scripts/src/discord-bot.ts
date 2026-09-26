@@ -25,6 +25,7 @@ import {
   UserSelectMenuBuilder,
   type Attachment,
   type ButtonInteraction,
+  type Guild,
   type Message,
   type ModalSubmitInteraction,
   type ThreadChannel,
@@ -77,6 +78,7 @@ let stopProfileCommand = () => {};
 let stopTaskListFeature = () => {};
 let stopForestLinkFeature = () => {};
 let botActivityTimer: NodeJS.Timeout | undefined;
+let allowedGuildId: string | undefined;
 const commentMemberRemovalTimers = new Map<string, NodeJS.Timeout>();
 const commentMemberQueues = new Map<string, Promise<void>>();
 const client = new Client({
@@ -2215,6 +2217,7 @@ async function validateConfiguredChannel() {
     return;
   }
 
+  allowedGuildId = channel.guildId;
   const member = channel.guild.members.me;
   const permissions = member ? channel.permissionsFor(member) : null;
   const requiredPermissions: Array<[bigint, string]> = [
@@ -2255,6 +2258,32 @@ async function validateConfiguredChannel() {
       channelId,
       permissions: missingCommentPermissions.join(", "),
     });
+  }
+}
+
+async function leaveUnauthorizedGuild(guild: Guild) {
+  if (!allowedGuildId || guild.id === allowedGuildId) return;
+
+  writeLog("warn", "unauthorized_guild_detected", { guildId: guild.id });
+  try {
+    await guild.leave();
+    writeLog("info", "unauthorized_guild_left", { guildId: guild.id });
+  } catch (error: unknown) {
+    writeLog("error", "unauthorized_guild_leave_failed", {
+      guildId: guild.id,
+      ...safeErrorDetails(error),
+    });
+  }
+}
+
+async function leaveUnauthorizedGuilds() {
+  if (!allowedGuildId) {
+    writeLog("error", "allowed_guild_unresolved", { channelId });
+    return;
+  }
+
+  for (const guild of client.guilds.cache.values()) {
+    await leaveUnauthorizedGuild(guild);
   }
 }
 
@@ -2532,9 +2561,11 @@ client.once(Events.ClientReady, (readyClient) => {
   };
   updateBotActivity();
   botActivityTimer = setInterval(updateBotActivity, 5_000);
-  void validateConfiguredChannel().catch((error: unknown) => {
-    writeLog("error", "channel_validation_failed", safeErrorDetails(error));
-  });
+  void validateConfiguredChannel()
+    .then(() => leaveUnauthorizedGuilds())
+    .catch((error: unknown) => {
+      writeLog("error", "channel_validation_failed", safeErrorDetails(error));
+    });
   void validateFormattedMessageChannel().catch((error: unknown) => {
     writeLog("error", "formatted_message_channel_validation_failed", {
       channelId: formattedMessageChannelId,
@@ -2566,6 +2597,10 @@ client.once(Events.ClientReady, (readyClient) => {
 
 client.on(Events.Error, (error) => {
   writeLog("error", "discord_client_error", safeErrorDetails(error));
+});
+
+client.on(Events.GuildCreate, (guild) => {
+  void leaveUnauthorizedGuild(guild);
 });
 
 async function shutdown(signal: string) {
