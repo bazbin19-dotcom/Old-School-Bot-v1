@@ -313,6 +313,7 @@ async function sendProfileMessage(
   commandMessage: Message,
   client: Client,
   pool: Pool,
+  ownerId = commandMessage.author.id,
 ) {
   if (!commandMessage.guildId) {
     throw new Error("Profile command must be used in a server.");
@@ -321,7 +322,7 @@ async function sendProfileMessage(
     client,
     pool,
     commandMessage.guildId,
-    commandMessage.author.id,
+    ownerId,
     0,
   );
   const image = await renderProfileCard(view.card);
@@ -887,24 +888,33 @@ export function attachProfileCommand(client: Client, pool: Pool) {
     if (
       !message.inGuild() ||
       message.author.bot ||
-      message.channelId !== profileCommandChannelId ||
-      message.content.trim() !== "بروفايل"
+      message.channelId !== profileCommandChannelId
     ) {
       return;
     }
 
-    void sendProfileMessage(message, client, pool).catch(async (error: unknown) => {
-      logProfileError("profile_image_generation_failed", error, {
-        userId: message.author.id,
-        channelId: message.channelId,
-      });
-      await message
-        .reply({
-          content: "تعذر إنشاء الملف الشخصي حالياً. حاول مرة أخرى بعد قليل.",
-          allowedMentions: { repliedUser: false },
-        })
-        .catch(() => null);
-    });
+    const command = /^بروفايل(?:\s+<@!?(\d{17,20})>)?$/.exec(
+      message.content.trim(),
+    );
+    if (!command) return;
+
+    const targetId = command[1] ?? message.author.id;
+    if (command[1] && !message.mentions.users.has(targetId)) return;
+
+    void sendProfileMessage(message, client, pool, targetId).catch(
+      async (error: unknown) => {
+        logProfileError("profile_image_generation_failed", error, {
+          userId: targetId,
+          channelId: message.channelId,
+        });
+        await message
+          .reply({
+            content: "تعذر إنشاء الملف الشخصي حالياً. حاول مرة أخرى بعد قليل.",
+            allowedMentions: { repliedUser: false },
+          })
+          .catch(() => null);
+      },
+    );
   };
 
   const onInteraction = (interaction: Interaction) => {
