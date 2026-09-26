@@ -110,11 +110,54 @@ export function parseForestJoinLink(content: string) {
   return null;
 }
 
-function buildPrivatePrompt(sourceMessageId: string, roomCode: string) {
+function normalizeDigits(value: string) {
+  return value
+    .replace(/[٠-٩]/g, (digit) => String("٠١٢٣٤٥٦٧٨٩".indexOf(digit)))
+    .replace(/[۰-۹]/g, (digit) => String("۰۱۲۳۴۵۶۷۸۹".indexOf(digit)));
+}
+
+export function parseForestTextDetails(content: string) {
+  const text = normalizeDigits(
+    content.replace(/https?:\/\/[^\s<>]+/g, " ").replace(/<@!?[0-9]+>/g, " "),
+  );
+  const durationMatch = text.match(
+    /(\d{1,3})\s*(?:-\s*)?(?:minutes?|mins?|دقيقة|دقائق|دقيقه|دقايق)(?=$|[\s,.;!?])/i,
+  );
+  const candidateDuration = durationMatch ? Number(durationMatch[1]) : null;
+  const durationMinutes =
+    candidateDuration && candidateDuration <= 999 ? candidateDuration : null;
+
+  const arabicTreeMatch = text.match(
+    /(?:نوع\s+الشجرة|الشجرة)\s*[:：-]?\s*([^\n,;.!?]+)/u,
+  );
+  const englishTreeMatch = text.match(
+    /\bplant\s+(?:a\s+)?\d{1,3}\s*-?\s*minutes?\s+(.+?)(?=\s+(?:with\s+(?:me|us)|you\s+can|also\s+tap|tap\s+on)\b|[.!?\n]|$)/i,
+  );
+  const treeName = (
+    arabicTreeMatch?.[1]
+      ?.replace(/\s*(?:مدة الدراسة|المدة|مدة|كود الغرفة).*$/u, "")
+      .replace(/\s*[⏳⌛].*$/u, "")
+      .trim() ??
+    englishTreeMatch?.[1]?.trim() ??
+    ""
+  ).slice(0, 60);
+
+  return {
+    treeName: treeName || null,
+    durationMinutes,
+  };
+}
+
+function buildPrivatePrompt(
+  sourceMessageId: string,
+  roomCode: string,
+  treeName: string | null,
+  durationMinutes: number | null,
+) {
   const buttons = new ActionRowBuilder<ButtonBuilder>().addComponents(
     new ButtonBuilder()
       .setCustomId(`forest:details:${sourceMessageId}`)
-      .setLabel("تحديد الشجرة والمدة")
+      .setLabel("إكمال التفاصيل")
       .setEmoji("🌱")
       .setStyle(ButtonStyle.Primary),
     new ButtonBuilder()
@@ -130,9 +173,11 @@ function buildPrivatePrompt(sourceMessageId: string, roomCode: string) {
         [
           "## 🌳 تجهيز بطاقة Forest",
           `تم استخراج كود الغرفة: **${roomCode}**`,
+          `الشجرة: **${treeName || "غير مذكور"}**`,
+          `المدة: **${durationMinutes ? `${durationMinutes} دقيقة` : "غير مذكور"}**`,
           "",
-          "يمكنك إدخال نوع الشجرة والمدة بالدقائق، أو اختيار «عدم ذكرها».",
-          "إذا تركت أحد الحقلين فارغاً فسيظهر ذلك الحقل «غير مذكور».",
+          "استخرجت المعلومات المتاحة من نص الرابط. يمكنك إكمال الحقول الناقصة أو اختيار «عدم ذكرها».",
+          "إذا تركت حقلاً ناقصاً فارغاً فسيظهر «غير مذكور».",
         ].join("\n"),
       ),
     )
@@ -153,34 +198,42 @@ function buildPrivateDoneMessage(publicMessageUrl: string, skipped: boolean) {
 }
 
 function makeForestDetailsModal(sourceMessageId: string) {
-  const tree = new TextInputBuilder()
-    .setCustomId("forest_tree_name")
-    .setLabel("نوع الشجرة")
-    .setPlaceholder("مثال: أرز")
-    .setStyle(TextInputStyle.Short)
-    .setMaxLength(60)
-    .setRequired(false);
-  const duration = new TextInputBuilder()
-    .setCustomId("forest_duration")
-    .setLabel("مدة الدراسة بالدقائق")
-    .setPlaceholder("مثال: 120")
-    .setStyle(TextInputStyle.Short)
-    .setMaxLength(8)
-    .setRequired(false);
+function makeForestDetailsModal(
+  sourceMessageId: string,
+  needsTree: boolean,
+  needsDuration: boolean,
+) {
+  const rows: ActionRowBuilder<TextInputBuilder>[] = [];
+  if (needsTree) {
+    const tree = new TextInputBuilder()
+      .setCustomId("forest_tree_name")
+      .setLabel("نوع الشجرة")
+      .setPlaceholder("مثال: أرز")
+      .setStyle(TextInputStyle.Short)
+      .setMaxLength(60)
+      .setRequired(false);
+    rows.push(new ActionRowBuilder<TextInputBuilder>().addComponents(tree));
+  }
+  if (needsDuration) {
+    const duration = new TextInputBuilder()
+      .setCustomId("forest_duration")
+      .setLabel("مدة الدراسة بالدقائق")
+      .setPlaceholder("مثال: 120")
+      .setStyle(TextInputStyle.Short)
+      .setMaxLength(8)
+      .setRequired(false);
+    rows.push(
+      new ActionRowBuilder<TextInputBuilder>().addComponents(duration),
+    );
+  }
   return new ModalBuilder()
     .setCustomId(`forest:details_submit:${sourceMessageId}`)
     .setTitle("تفاصيل جلسة Forest")
-    .addComponents(
-      new ActionRowBuilder<TextInputBuilder>().addComponents(tree),
-      new ActionRowBuilder<TextInputBuilder>().addComponents(duration),
-    );
+    .addComponents(...rows);
 }
 
 function normalizeDuration(value: string) {
-  const westernDigits = value
-    .trim()
-    .replace(/[٠-٩]/g, (digit) => String("٠١٢٣٤٥٦٧٨٩".indexOf(digit)))
-    .replace(/[۰-۹]/g, (digit) => String("۰۱۲۳۴۵۶۷۸۹".indexOf(digit)));
+  const westernDigits = normalizeDigits(value.trim());
   if (!westernDigits) return null;
   if (!/^\d{1,4}$/.test(westernDigits)) return undefined;
   const minutes = Number(westernDigits);
