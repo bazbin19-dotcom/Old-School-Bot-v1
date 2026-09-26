@@ -57,10 +57,14 @@ const retrySourceMessageId = process.env.DISCORD_RETRY_SOURCE_MESSAGE_ID;
 const maxUploadBytes = 8 * 1024 * 1024;
 const maxCaptionLength = 2_000;
 const legacySeparator = "────────────────────────────────";
+const commentInactivityMs = 5 * 60_000;
+const commentRemovalRetryMs = 60_000;
 
 const pool = new Pool({ connectionString: databaseUrl });
 let stopDailyPostRewards = () => {};
 let stopProfileCommand = () => {};
+const commentMemberRemovalTimers = new Map<string, NodeJS.Timeout>();
+const commentMemberQueues = new Map<string, Promise<void>>();
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
@@ -93,6 +97,14 @@ type ImagePost = {
   images: string[];
   comments_locked: boolean;
   thread_id: string | null;
+};
+
+type ThreadCommentActivityRow = QueryResultRow & {
+  post_message_id: string;
+  guild_id: string;
+  thread_id: string;
+  user_id: string;
+  last_comment_at: Date;
 };
 
 type WhisperMode = "anonymous" | "identified";
@@ -184,6 +196,16 @@ async function initializeDatabase() {
       user_id text NOT NULL,
       created_at timestamptz NOT NULL DEFAULT now(),
       PRIMARY KEY (message_id, user_id)
+    )
+  `);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS discord_image_thread_comment_activity (
+      post_message_id text NOT NULL REFERENCES discord_image_posts(message_id) ON DELETE CASCADE,
+      guild_id text NOT NULL,
+      thread_id text NOT NULL,
+      user_id text NOT NULL,
+      last_comment_at timestamptz NOT NULL,
+      PRIMARY KEY (thread_id, user_id)
     )
   `);
   await pool.query(`
@@ -745,10 +767,14 @@ async function getWhisper(whisperId: string) {
   return result.rows[0] ?? null;
 }
 
-function isUnknownDiscordMessage(error: unknown) {
+function hasDiscordErrorCode(error: unknown, expectedCode: number) {
   if (!error || typeof error !== "object") return false;
   const code = (error as { code?: unknown }).code;
-  return code === 10008 || code === "10008";
+  return code === expectedCode || code === String(expectedCode);
+}
+
+function isUnknownDiscordMessage(error: unknown) {
+  return hasDiscordErrorCode(error, 10008);
 }
 
 let whisperExpirationCleanupRunning = false;
@@ -1389,6 +1415,285 @@ async function getOrCreateCommentThread(post: ImagePost) {
   return thread;
 }
 
+function commentMemberKey(threadId: string, userId: string) {
+  return `${threadId}:${userId}`;
+}
+
+async function withCommentMemberQueue<T>(
+  threadId: string,
+  userId: string,
+  operation: () => Promise<T>,
+): Promise<T> {
+  const key = commentMemberKey(threadId, userId);
+  const previous = commentMemberQueues.get(key) ?? Promise.resolve();
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const queued = previous.then(
+    () => gate,
+    () => gate,
+  );
+  commentMemberQueues.set(key, queued);
+  await previous.catch(() => undefined);
+
+  try {
+    return await operation();
+  } finally {
+    release();
+    if (commentMemberQueues.get(key) === queued) {
+      commentMemberQueues.delete(key);
+    }
+  }
+}
+
+function scheduleCommentMemberRemoval(
+  activity: ThreadCommentActivityRow,
+  delayOverrideMs?: number,
+) {
+  const key = commentMemberKey(activity.thread_id, activity.user_id);
+  const previousTimer = commentMemberRemovalTimers.get(key);
+  if (previousTimer) clearTimeout(previousTimer);
+
+  const remainingMs =
+    delayOverrideMs ??
+    Math.max(
+      0,
+      activity.last_comment_at.getTime() + commentInactivityMs - Date.now(),
+    );
+  const timer = setTimeout(() => {
+    if (commentMemberRemovalTimers.get(key) !== timer) return;
+    commentMemberRemovalTimers.delete(key);
+    void removeInactiveThreadCommenter(activity).catch(async (error: unknown) => {
+      writeLog("warn", "image_comment_member_expulsion_failed", {
+        guildId: activity.guild_id,
+        channelId: activity.thread_id,
+        userId: activity.user_id,
+        ...safeErrorDetails(error),
+      });
+      try {
+        const current = await pool.query<ThreadCommentActivityRow>(
+          `SELECT post_message_id, guild_id, thread_id, user_id, last_comment_at
+           FROM discord_image_thread_comment_activity
+           WHERE thread_id = $1 AND user_id = $2`,
+          [activity.thread_id, activity.user_id],
+        );
+        const latestActivity = current.rows[0];
+        if (!latestActivity) return;
+        const hasNewActivity =
+          latestActivity.last_comment_at.getTime() !==
+          activity.last_comment_at.getTime();
+        scheduleCommentMemberRemoval(
+          latestActivity,
+          hasNewActivity ? undefined : commentRemovalRetryMs,
+        );
+      } catch (retryError) {
+        writeLog("error", "image_comment_member_retry_schedule_failed", {
+          guildId: activity.guild_id,
+          channelId: activity.thread_id,
+          userId: activity.user_id,
+          ...safeErrorDetails(retryError),
+        });
+      }
+    });
+  }, remainingMs);
+  timer.unref();
+  commentMemberRemovalTimers.set(key, timer);
+}
+
+async function removeInactiveThreadCommenter(
+  initialActivity: ThreadCommentActivityRow,
+) {
+  await withCommentMemberQueue(
+    initialActivity.thread_id,
+    initialActivity.user_id,
+    async () => {
+      const current = await pool.query<ThreadCommentActivityRow>(
+        `SELECT post_message_id, guild_id, thread_id, user_id, last_comment_at
+         FROM discord_image_thread_comment_activity
+         WHERE thread_id = $1 AND user_id = $2`,
+        [initialActivity.thread_id, initialActivity.user_id],
+      );
+      const activity = current.rows[0];
+      if (!activity) return;
+
+      const remainingMs =
+        activity.last_comment_at.getTime() + commentInactivityMs - Date.now();
+      if (remainingMs > 0) {
+        scheduleCommentMemberRemoval(activity);
+        return;
+      }
+
+      let thread;
+      try {
+        thread = await client.channels.fetch(activity.thread_id);
+      } catch (error) {
+        if (hasDiscordErrorCode(error, 10003)) {
+          await pool.query(
+            `DELETE FROM discord_image_thread_comment_activity
+             WHERE post_message_id = $1
+               AND thread_id = $2
+               AND user_id = $3
+               AND last_comment_at = $4`,
+            [
+              activity.post_message_id,
+              activity.thread_id,
+              activity.user_id,
+              activity.last_comment_at,
+            ],
+          );
+          return;
+        }
+        throw error;
+      }
+
+      if (!thread || !thread.isThread()) {
+        await pool.query(
+          `DELETE FROM discord_image_thread_comment_activity
+           WHERE post_message_id = $1
+             AND thread_id = $2
+             AND user_id = $3
+             AND last_comment_at = $4`,
+          [
+            activity.post_message_id,
+            activity.thread_id,
+            activity.user_id,
+            activity.last_comment_at,
+          ],
+        );
+        return;
+      }
+
+      const botMember = thread.guild.members.me ?? (await thread.guild.members.fetchMe());
+      const permissions = thread.permissionsFor(botMember);
+      if (!permissions?.has(PermissionFlagsBits.ManageThreads)) {
+        throw new Error("The bot needs Manage Threads to remove inactive commenters.");
+      }
+
+      try {
+        await thread.members.remove(activity.user_id);
+      } catch (error) {
+        if (!hasDiscordErrorCode(error, 10007)) throw error;
+      }
+
+      const deleted = await pool.query(
+        `DELETE FROM discord_image_thread_comment_activity
+         WHERE post_message_id = $1
+           AND thread_id = $2
+           AND user_id = $3
+           AND last_comment_at = $4`,
+        [
+          activity.post_message_id,
+          activity.thread_id,
+          activity.user_id,
+          activity.last_comment_at,
+        ],
+      );
+      if ((deleted.rowCount ?? 0) > 0) {
+        writeLog("info", "image_comment_member_removed", {
+          guildId: activity.guild_id,
+          channelId: activity.thread_id,
+          postMessageId: activity.post_message_id,
+          userId: activity.user_id,
+        });
+      }
+    },
+  );
+}
+
+async function recordThreadCommentActivity(
+  postMessageId: string,
+  thread: import("discord.js").ThreadChannel,
+  userId: string,
+  activityAt: Date,
+  addToThread: boolean,
+) {
+  return withCommentMemberQueue(thread.id, userId, async () => {
+    const result = await pool.query<ThreadCommentActivityRow>(
+      `INSERT INTO discord_image_thread_comment_activity
+         (post_message_id, guild_id, thread_id, user_id, last_comment_at)
+       VALUES ($1, $2, $3, $4, $5)
+       ON CONFLICT (thread_id, user_id)
+       DO UPDATE SET
+         post_message_id = EXCLUDED.post_message_id,
+         guild_id = EXCLUDED.guild_id,
+         last_comment_at = GREATEST(
+           discord_image_thread_comment_activity.last_comment_at,
+           EXCLUDED.last_comment_at
+         )
+       RETURNING post_message_id, guild_id, thread_id, user_id, last_comment_at`,
+      [postMessageId, thread.guild.id, thread.id, userId, activityAt],
+    );
+    const activity = result.rows[0];
+    if (!activity) throw new Error("Could not record the image-thread comment.");
+
+    let memberAdded = true;
+    if (addToThread) {
+      const botMember = thread.guild.members.me;
+      if (
+        !botMember ||
+        !thread
+          .permissionsFor(botMember)
+          ?.has(PermissionFlagsBits.ManageThreads)
+      ) {
+        memberAdded = false;
+      } else {
+        try {
+          await thread.members.add(userId);
+        } catch (error) {
+          memberAdded = false;
+          writeLog("warn", "image_comment_member_add_failed", {
+            guildId: thread.guild.id,
+            channelId: thread.id,
+            userId,
+            ...safeErrorDetails(error),
+          });
+        }
+      }
+    }
+
+    scheduleCommentMemberRemoval(activity);
+    return memberAdded;
+  });
+}
+
+async function handleImageThreadComment(message: Message) {
+  if (message.author.bot || !message.guildId || !message.channel.isThread()) return;
+  if (!message.channel.parentId) return;
+
+  const post = await pool.query<{ message_id: string }>(
+    `SELECT message_id
+     FROM discord_image_posts
+     WHERE thread_id = $1
+       AND channel_id = $2
+       AND comments_locked = false`,
+    [message.channel.id, message.channel.parentId],
+  );
+  const postMessageId = post.rows[0]?.message_id;
+  if (!postMessageId) return;
+
+  await recordThreadCommentActivity(
+    postMessageId,
+    message.channel,
+    message.author.id,
+    message.createdAt,
+    false,
+  );
+}
+
+async function restorePendingCommentMemberRemovals() {
+  const pending = await pool.query<ThreadCommentActivityRow>(
+    `SELECT post_message_id, guild_id, thread_id, user_id, last_comment_at
+     FROM discord_image_thread_comment_activity`,
+  );
+  for (const activity of pending.rows) {
+    scheduleCommentMemberRemoval(activity);
+  }
+  writeLog("info", "image_comment_member_cleanup_ready", {
+    pendingCount: pending.rows.length,
+  });
+}
+
 async function handleModalSubmit(interaction: ModalSubmitInteraction) {
   const [prefix, action, messageId, recipientId] = interaction.customId.split(":");
   if (prefix === "whisper" && action === "submit") {
@@ -1434,6 +1739,34 @@ async function handleModalSubmit(interaction: ModalSubmitInteraction) {
       content: `<@${interaction.user.id}>: ${comment}`,
       allowedMentions: { parse: [], users: [interaction.user.id] },
     });
+    let memberAdded = false;
+    try {
+      memberAdded = await recordThreadCommentActivity(
+        post.message_id,
+        thread,
+        interaction.user.id,
+        new Date(),
+        true,
+      );
+    } catch (error) {
+      writeLog("warn", "image_comment_activity_schedule_failed", {
+        guildId: thread.guild.id,
+        channelId: thread.id,
+        postMessageId: post.message_id,
+        userId: interaction.user.id,
+        ...safeErrorDetails(error),
+      });
+      await interaction.editReply(
+        "تم نشر تعليقك، لكن تعذر إعداد الخروج التلقائي من الثريد بعد خمس دقائق.",
+      );
+      return;
+    }
+    if (!memberAdded) {
+      await interaction.editReply(
+        "تم نشر تعليقك، لكن يحتاج البوت صلاحية إدارة الثريد حتى يضيفك مؤقتاً ثم يخرجك بعد خمس دقائق.",
+      );
+      return;
+    }
     await interaction.editReply("تم نشر تعليقك في نقاش الصورة.");
   }
 }
@@ -1896,6 +2229,7 @@ async function validateConfiguredChannel() {
   const commentPermissions: Array<[bigint, string]> = [
     [PermissionFlagsBits.CreatePublicThreads, "Create Public Threads"],
     [PermissionFlagsBits.SendMessagesInThreads, "Send Messages in Threads"],
+    [PermissionFlagsBits.ManageThreads, "Manage Threads"],
   ];
   const missingCommentPermissions = permissions
     ? commentPermissions
