@@ -5,12 +5,12 @@ import {
   ButtonBuilder,
   ButtonStyle,
   ContainerBuilder,
-  EmbedBuilder,
-  MediaGalleryBuilder,
   MessageFlags,
+  SectionBuilder,
   SeparatorBuilder,
   SeparatorSpacingSize,
   TextDisplayBuilder,
+  ThumbnailBuilder,
   type Message,
   type TextChannel,
 } from "discord.js";
@@ -52,20 +52,50 @@ function createAttachment(kind: keyof typeof imageAssets, buffer: Buffer) {
   return new AttachmentBuilder(buffer, { name: imageAssets[kind].fileName });
 }
 
+function createStreakPanel(
+  title: string,
+  accentColor: number,
+  imageKind: keyof typeof imageAssets,
+) {
+  const fileName = imageAssets[imageKind].fileName;
+  const header = new SectionBuilder()
+    .addTextDisplayComponents(
+      new TextDisplayBuilder().setContent(`# ${title}`),
+    )
+    .setThumbnailAccessory(
+      new ThumbnailBuilder().setURL(`attachment://${fileName}`),
+    );
+
+  return new ContainerBuilder()
+    .setAccentColor(accentColor)
+    .addSectionComponents(header);
+}
+
 export async function sendStreakRenewedMessage(
   channel: TextChannel,
   userId: string,
   streakDays: number,
 ) {
   const image = await getAssetBuffer("renewed");
-  const fileName = imageAssets.renewed.fileName;
+  const panel = createStreakPanel(
+    "✅ • Streak updated",
+    0x35c879,
+    "renewed",
+  )
+    .addSeparatorComponents(
+      new SeparatorBuilder()
+        .setDivider(true)
+        .setSpacing(SeparatorSpacingSize.Small),
+    )
+    .addTextDisplayComponents(
+      new TextDisplayBuilder().setContent(
+        `• <@${userId}>\n  ◦ 🔥 • **${streakDays}**`,
+      ),
+    );
+
   return channel.send({
-    content: `<@${userId}> تم تجديد ستريكك إلى **${streakDays}** يوم.`,
-    embeds: [
-      new EmbedBuilder()
-        .setColor(0xff7800)
-        .setImage(`attachment://${fileName}`),
-    ],
+    components: [panel],
+    flags: MessageFlags.IsComponentsV2,
     files: [createAttachment("renewed", image)],
     allowedMentions: { users: [userId], parse: [] },
   });
@@ -79,20 +109,28 @@ export async function sendStreakReminderMessage(
 ) {
   const image = await getAssetBuffer("reminder");
   const isThreeHours = kind === "three_hours";
-  const title = isThreeHours ? "تذكير الستريك — بقيت ٣ ساعات" : "تذكير الستريك — بقيت ساعة";
-  const description = isThreeHours
-    ? `انشر اليوم قبل منتصف الليل للحفاظ على ستريكك الحالي (${streakDays} 🔥).`
-    : `بقيت ساعة واحدة قبل منتصف الليل. انشر الآن حتى لا ينتهي ستريكك الحالي (${streakDays} 🔥).`;
+  const remainingTime = isThreeHours
+    ? "بقيت ٣ ساعات قبل منتصف الليل. انشر اليوم للحفاظ على ستريكك."
+    : "بقيت ساعة واحدة قبل منتصف الليل. انشر الآن للحفاظ على ستريكك.";
+  const panel = createStreakPanel(
+    "🟠 • Streak Remember",
+    0xffa726,
+    "reminder",
+  )
+    .addSeparatorComponents(
+      new SeparatorBuilder()
+        .setDivider(true)
+        .setSpacing(SeparatorSpacingSize.Small),
+    )
+    .addTextDisplayComponents(
+      new TextDisplayBuilder().setContent(
+        `• <@${userId}>\n  ◦ 🔥 • **${streakDays}**\n\n${remainingTime}`,
+      ),
+    );
 
   return channel.send({
-    content: `<@${userId}>`,
-    embeds: [
-      new EmbedBuilder()
-        .setColor(0xff7800)
-        .setTitle(title)
-        .setDescription(description)
-        .setImage(`attachment://${imageAssets.reminder.fileName}`),
-    ],
+    components: [panel],
+    flags: MessageFlags.IsComponentsV2,
     files: [createAttachment("reminder", image)],
     allowedMentions: { users: [userId], parse: [] },
   });
@@ -105,30 +143,35 @@ export async function sendExpiredStreakMessage(
   recoveryDeadline: Date,
 ): Promise<Message> {
   const image = await getAssetBuffer("expired");
-  const fileName = imageAssets.expired.fileName;
   const formattedDeadline = deadlineFormatter.format(recoveryDeadline);
   const recoveryButton = new ButtonBuilder()
     .setCustomId(`streak:recover:${userId}`)
     .setEmoji("🔥")
     .setLabel("استرداد الستريك")
     .setStyle(ButtonStyle.Primary);
-  const firstPanel = new ContainerBuilder()
-    .setAccentColor(0x91999f)
+  const panel = createStreakPanel(
+    "❌ • Streak failed",
+    0xe5484d,
+    "expired",
+  )
+    .addSeparatorComponents(
+      new SeparatorBuilder()
+        .setDivider(true)
+        .setSpacing(SeparatorSpacingSize.Small),
+    )
     .addTextDisplayComponents(
       new TextDisplayBuilder().setContent(
-        `## انتهى ستريكك\n<@${userId}> انتهت سلسلة النشر اليومية الخاصة بك.`,
+        `• <@${userId}>\n  ◦ Total (**${streakDays}**)`,
       ),
     )
-    .addMediaGalleryComponents(
-      new MediaGalleryBuilder().addItems({
-        media: { url: `attachment://${fileName}` },
-      }),
-    );
-  const recoveryPanel = new ContainerBuilder()
-    .setAccentColor(0x91999f)
+    .addSeparatorComponents(
+      new SeparatorBuilder()
+        .setDivider(true)
+        .setSpacing(SeparatorSpacingSize.Small),
+    )
     .addTextDisplayComponents(
       new TextDisplayBuilder().setContent(
-        `### لديك فرصة للاسترداد\nيمكنك استعادة **${streakDays} 🔥** خلال يومين، حتى **${formattedDeadline}** بتوقيت بغداد. بعد انتهاء المهلة، ستبدأ من ١ عند نشرك التالي.`,
+        `### فرصة الاسترداد\nيمكنك استعادة **${streakDays} 🔥** خلال يومين، حتى **${formattedDeadline}** بتوقيت بغداد. بعد انتهاء المهلة، ستبدأ من ١ عند نشرك التالي.`,
       ),
     )
     .addActionRowComponents(
@@ -136,13 +179,7 @@ export async function sendExpiredStreakMessage(
     );
 
   return channel.send({
-    components: [
-      firstPanel,
-      new SeparatorBuilder()
-        .setDivider(true)
-        .setSpacing(SeparatorSpacingSize.Small),
-      recoveryPanel,
-    ],
+    components: [panel],
     flags: MessageFlags.IsComponentsV2,
     files: [createAttachment("expired", image)],
     allowedMentions: { users: [userId], parse: [] },
