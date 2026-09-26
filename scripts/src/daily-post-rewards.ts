@@ -1,4 +1,5 @@
 import {
+  ChannelType,
   Events,
   PermissionFlagsBits,
   type Client,
@@ -6,8 +7,16 @@ import {
   type GuildMember,
   type Message,
   type Role,
+  type TextChannel,
+  type ButtonInteraction,
+  type Interaction,
 } from "discord.js";
 import type { Pool } from "pg";
+import {
+  sendExpiredStreakMessage,
+  sendStreakReminderMessage,
+  sendStreakRenewedMessage,
+} from "./daily-streak-messages.js";
 
 const rewardChannelIds = new Set([
   "1546491043334201374",
@@ -23,6 +32,7 @@ const rewardChannelIds = new Set([
   "1546491554892484669",
   "1546491651198034020",
 ]);
+const streakNoticeChannelId = "1546917729695432795";
 
 const dateFormatter = new Intl.DateTimeFormat("en-GB", {
   timeZone: "Asia/Baghdad",
@@ -30,17 +40,106 @@ const dateFormatter = new Intl.DateTimeFormat("en-GB", {
   month: "2-digit",
   day: "2-digit",
 });
+const baghdadClockFormatter = new Intl.DateTimeFormat("en-GB", {
+  timeZone: "Asia/Baghdad",
+  year: "numeric",
+  month: "2-digit",
+  day: "2-digit",
+  hour: "2-digit",
+  minute: "2-digit",
+  hourCycle: "h23",
+});
 
 const memberQueues = new Map<string, Promise<void>>();
 const roleCreationPromises = new Map<string, Promise<Role>>();
 let cleanupTimer: NodeJS.Timeout | undefined;
 let cleanupRunning = false;
+let maintenanceRunning = false;
+let lastNoticePruneDate: string | undefined;
 
 type DailyStreakRow = {
   streak_days: number;
   last_post_date: string;
 };
 
+type RecoveryStateRow = {
+  streak_days: number;
+  last_post_date: string;
+  expired_streak_days: number;
+  recovery_expires_at: Date | null;
+  recovery_message_id: string | null;
+};
+
+type RecoveryNoticeRow = {
+  expired_streak_days: number;
+  recovery_expires_at: Date | null;
+  recovery_message_id: string | null;
+};
+
+type StreakNoticeKind = "renewed" | "reminder_3h" | "reminder_1h";
+
+function baghdadClock(date: Date) {
+  const parts = new Map(
+    baghdadClockFormatter
+      .formatToParts(date)
+      .map(({ type, value }) => [type, value] as const),
+  );
+  const year = parts.get("year");
+  const month = parts.get("month");
+  const day = parts.get("day");
+  const hour = parts.get("hour");
+  const minute = parts.get("minute");
+  if (!year || !month || !day || !hour || !minute) {
+    throw new Error("Could not determine the Baghdad local time.");
+  }
+  return {
+    date: `${year}-${month}-${day}`,
+    hour: Number(hour),
+    minute: Number(minute),
+  };
+}
+
+async function getStreakNoticeChannel(client: Client): Promise<TextChannel> {
+  const channel = await client.channels.fetch(streakNoticeChannelId);
+  if (!channel || channel.type !== ChannelType.GuildText) {
+    throw new Error("The configured streak-notice channel is unavailable.");
+  }
+  return channel;
+}
+
+async function sendStreakNoticeOnce(
+  pool: Pool,
+  guildId: string,
+  userId: string,
+  noticeDate: string,
+  noticeKind: StreakNoticeKind,
+  deliver: () => Promise<unknown>,
+) {
+  const claim = await pool.query(
+    `INSERT INTO discord_daily_post_notices
+       (guild_id, user_id, notice_date, notice_type)
+     VALUES ($1, $2, $3::date, $4)
+     ON CONFLICT (guild_id, user_id, notice_date, notice_type) DO NOTHING
+     RETURNING user_id`,
+    [guildId, userId, noticeDate, noticeKind],
+  );
+  if (claim.rows.length === 0) return false;
+
+  try {
+    await deliver();
+    return true;
+  } catch (error) {
+    await pool.query(
+      `DELETE FROM discord_daily_post_notices
+       WHERE guild_id = $1
+         AND user_id = $2
+         AND notice_date = $3::date
+         AND notice_type = $4`,
+      [guildId, userId, noticeDate, noticeKind],
+    );
+    throw error;
+  }
+}
 function baghdadDateString(date: Date) {
   const parts = new Map(
     dateFormatter
@@ -230,13 +329,72 @@ async function getDailyRole(
   }
 }
 
+async function assignDailyRole(
+  guild: Guild,
+  pool: Pool,
+  member: GuildMember,
+  streakDays: number,
+) {
+  const botMember = await getBotMemberWithRolePermission(guild);
+  const rewardRole = await getDailyRole(guild, pool, botMember, streakDays);
+  let updatedMember = member;
+  const alreadyHasReward = updatedMember.roles.cache.has(rewardRole.id);
+  if (!alreadyHasReward) {
+    updatedMember = await updatedMember.roles.add(
+      rewardRole,
+      "Daily posting streak updated",
+    );
+  }
+
+  const mappedRoles = await pool.query<{ role_id: string }>(
+    `SELECT role_id
+     FROM discord_daily_post_roles
+     WHERE guild_id = $1`,
+    [guild.id],
+  );
+  const previousRoleIds = mappedRoles.rows
+    .map((row) => row.role_id)
+    .filter(
+      (roleId) =>
+        roleId !== rewardRole.id && updatedMember.roles.cache.has(roleId),
+    );
+  if (previousRoleIds.length > 0) {
+    updatedMember = await updatedMember.roles.remove(
+      previousRoleIds,
+      "Replace the previous daily posting streak role",
+    );
+  }
+
+  return { rewardRole, alreadyHasReward, previousRoleIds };
+}
+
 async function updateMemberDailyRole(message: Message, pool: Pool) {
   const guild = message.guild;
   if (!guild) return;
 
   await withMemberQueue(guild.id, message.author.id, async () => {
-    const botMember = await getBotMemberWithRolePermission(guild);
     const activityDate = baghdadDateString(message.createdAt);
+    const previous = await pool.query<DailyStreakRow>(
+      `SELECT streak_days, last_post_date::text AS last_post_date
+       FROM discord_daily_post_streaks
+       WHERE guild_id = $1 AND user_id = $2`,
+      [guild.id, message.author.id],
+    );
+    const priorState = previous.rows[0];
+    if (
+      priorState &&
+      priorState.streak_days > 0 &&
+      priorState.last_post_date < previousCalendarDate(activityDate)
+    ) {
+      await expireStaleMemberRoleInQueue(
+        client,
+        pool,
+        guild.id,
+        message.author.id,
+        previousCalendarDate(activityDate),
+      );
+    }
+
     const streakResult = await pool.query<DailyStreakRow>(
       `INSERT INTO discord_daily_post_streaks
          (guild_id, user_id, streak_days, last_post_date)
@@ -264,36 +422,10 @@ async function updateMemberDailyRole(message: Message, pool: Pool) {
     const streakDays = streakResult.rows[0]?.streak_days;
     if (!streakDays || streakDays < 1) return;
 
-    const rewardRole = await getDailyRole(guild, pool, botMember, streakDays);
     let member = message.member;
     if (!member) member = await guild.members.fetch(message.author.id);
-
-    const alreadyHasReward = member.roles.cache.has(rewardRole.id);
-    if (!alreadyHasReward) {
-      member = await member.roles.add(
-        rewardRole,
-        "Posted in a daily-reward channel",
-      );
-    }
-
-    const mappedRoles = await pool.query<{ role_id: string }>(
-      `SELECT role_id
-       FROM discord_daily_post_roles
-       WHERE guild_id = $1`,
-      [guild.id],
-    );
-    const previousRoleIds = mappedRoles.rows
-      .map((row) => row.role_id)
-      .filter(
-        (roleId) =>
-          roleId !== rewardRole.id && member.roles.cache.has(roleId),
-      );
-    if (previousRoleIds.length > 0) {
-      await member.roles.remove(
-        previousRoleIds,
-        "Replace the previous daily posting streak role",
-      );
-    }
+    const { rewardRole, alreadyHasReward, previousRoleIds } =
+      await assignDailyRole(guild, pool, member, streakDays);
 
     if (!alreadyHasReward || previousRoleIds.length > 0) {
       console.log(
@@ -308,6 +440,31 @@ async function updateMemberDailyRole(message: Message, pool: Pool) {
           roleId: rewardRole.id,
         }),
       );
+    }
+
+    try {
+      const noticeChannel = await getStreakNoticeChannel(client);
+      if (noticeChannel.guildId === guild.id) {
+        await sendStreakNoticeOnce(
+          pool,
+          guild.id,
+          message.author.id,
+          activityDate,
+          "renewed",
+          () =>
+            sendStreakRenewedMessage(
+              noticeChannel,
+              message.author.id,
+              streakDays,
+            ),
+        );
+      }
+    } catch (error) {
+      logRoleFailure("daily_streak_renewal_notice_failed", error, {
+        guildId: guild.id,
+        userId: message.author.id,
+        channelId: streakNoticeChannelId,
+      });
     }
   });
 }
