@@ -224,65 +224,56 @@ async function loadProfileView(
 }
 
 function buildProfileButtons(view: ProfileView) {
-  const buttons: ButtonBuilder[] = [];
+  const rows: ActionRowBuilder<ButtonBuilder>[] = [];
   if (view.totalPosts > postsPerPage) {
-    buttons.push(
-      new ButtonBuilder()
-        .setCustomId(`profile:page:${view.ownerId}:${Math.max(0, view.page - 1)}`)
-        .setEmoji("⬅️")
-        .setLabel("السابق")
-        .setStyle(ButtonStyle.Secondary)
-        .setDisabled(view.page === 0),
+    rows.push(
+      new ActionRowBuilder<ButtonBuilder>().addComponents(
+        new ButtonBuilder()
+          .setCustomId(`profile:page:${view.ownerId}:${Math.max(0, view.page - 1)}`)
+          .setEmoji("⬅️")
+          .setLabel("السابق")
+          .setStyle(ButtonStyle.Secondary)
+          .setDisabled(view.page === 0),
+        new ButtonBuilder()
+          .setCustomId(
+            `profile:page:${view.ownerId}:${Math.min(view.totalPages - 1, view.page + 1)}`,
+          )
+          .setEmoji("➡️")
+          .setLabel("التالي")
+          .setStyle(ButtonStyle.Secondary)
+          .setDisabled(view.page >= view.totalPages - 1),
+      ),
     );
   }
 
-  buttons.push(
-    new ButtonBuilder()
-      .setCustomId(`profile:follow:${view.ownerId}:${view.page}`)
-      .setLabel("Follow")
-      .setStyle(ButtonStyle.Primary),
-    new ButtonBuilder()
-      .setCustomId(`profile:following:${view.ownerId}`)
-      .setLabel(`Following · ${view.followingCount}`)
-      .setEmoji("➡️")
-      .setStyle(ButtonStyle.Secondary),
-    new ButtonBuilder()
-      .setCustomId(`profile:followers:${view.ownerId}`)
-      .setLabel(`Followers · ${view.followerCount}`)
-      .setEmoji("👥")
-      .setStyle(ButtonStyle.Secondary),
-  );
-
-  if (view.totalPosts > postsPerPage) {
-    buttons.push(
+  rows.push(
+    new ActionRowBuilder<ButtonBuilder>().addComponents(
       new ButtonBuilder()
-        .setCustomId(
-          `profile:page:${view.ownerId}:${Math.min(view.totalPages - 1, view.page + 1)}`,
-        )
-        .setEmoji("➡️")
-        .setLabel("التالي")
-        .setStyle(ButtonStyle.Secondary)
-        .setDisabled(view.page >= view.totalPages - 1),
-    );
-  }
-
-  const settingsRow = new ActionRowBuilder<ButtonBuilder>().addComponents(
-    new ButtonBuilder()
-      .setCustomId(`profile:settings:${view.ownerId}:${view.page}`)
-      .setEmoji("⚙️")
-      .setLabel("الإعدادات")
-      .setStyle(ButtonStyle.Secondary),
+        .setCustomId(`profile:following:${view.ownerId}`)
+        .setLabel(`Following · ${view.followingCount}`)
+        .setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder()
+        .setCustomId(`profile:followers:${view.ownerId}`)
+        .setLabel(`Followers · ${view.followerCount}`)
+        .setStyle(ButtonStyle.Secondary),
+    ),
+    new ActionRowBuilder<ButtonBuilder>().addComponents(
+      new ButtonBuilder()
+        .setCustomId(`profile:follow:${view.ownerId}:${view.page}`)
+        .setLabel("Follow")
+        .setStyle(ButtonStyle.Primary),
+      new ButtonBuilder()
+        .setCustomId(`profile:settings:${view.ownerId}:${view.page}`)
+        .setEmoji("⚙️")
+        .setLabel("الإعدادات")
+        .setStyle(ButtonStyle.Secondary),
+    ),
   );
-
-  return {
-    profileRow: new ActionRowBuilder<ButtonBuilder>().addComponents(buttons),
-    settingsRow,
-  };
+  return rows;
 }
 
 function buildProfileContainer(view: ProfileView, imageUrl: string) {
-  const buttons = buildProfileButtons(view);
-  return new ContainerBuilder()
+  const container = new ContainerBuilder()
     .setAccentColor(0x45454c)
     .addMediaGalleryComponents(
       new MediaGalleryBuilder().addItems({ media: { url: imageUrl } }),
@@ -291,9 +282,11 @@ function buildProfileContainer(view: ProfileView, imageUrl: string) {
       new SeparatorBuilder()
         .setDivider(true)
         .setSpacing(SeparatorSpacingSize.Small),
-    )
-    .addActionRowComponents(buttons.profileRow)
-    .addActionRowComponents(buttons.settingsRow);
+    );
+  for (const row of buildProfileButtons(view)) {
+    container.addActionRowComponents(row);
+  }
+  return container;
 }
 
 function createProfileFileName(ownerId: string) {
