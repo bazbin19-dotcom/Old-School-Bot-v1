@@ -33,7 +33,14 @@ import {
   attachDailyPostRewards,
   initializeDailyPostRewardTables,
 } from "./daily-post-rewards.js";
-import { attachProfileCommand } from "./profile-command.js";
+import {
+  attachProfileCommand,
+  initializeProfileTables,
+} from "./profile-command.js";
+import {
+  profileImagePostChannelId,
+  profileXpPerPost,
+} from "./profile-store.js";
 
 function requireEnvironmentValue(name: string) {
   const value = process.env[name];
@@ -1629,22 +1636,49 @@ async function handleImageMessage(message: Message) {
     stage = "save_post";
     const storedImageNames = postImages.map(({ fileName }) => fileName);
 
-    await pool.query(
-      `INSERT INTO discord_image_posts
-         (message_id, source_message_id, channel_id, author_id, author_name,
-          author_avatar_url, caption, images)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb)`,
-      [
-        sentMessage.id,
-        message.id,
-        message.channelId,
-        message.author.id,
-        postPresentation.author_name,
-        postPresentation.author_avatar_url,
-        postPresentation.caption,
-        JSON.stringify(storedImageNames),
-      ],
-    );
+    if (!message.guildId) {
+      throw new Error("Image posts must belong to a server.");
+    }
+    const databaseClient = await pool.connect();
+    try {
+      await databaseClient.query("BEGIN");
+      await databaseClient.query(
+        `INSERT INTO discord_image_posts
+           (message_id, source_message_id, channel_id, author_id, author_name,
+            author_avatar_url, caption, images)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb)`,
+        [
+          sentMessage.id,
+          message.id,
+          message.channelId,
+          message.author.id,
+          postPresentation.author_name,
+          postPresentation.author_avatar_url,
+          postPresentation.caption,
+          JSON.stringify(storedImageNames),
+        ],
+      );
+      if (message.channelId === profileImagePostChannelId) {
+        await databaseClient.query(
+          `INSERT INTO discord_profile_xp_awards
+             (guild_id, message_id, user_id, xp_amount)
+           VALUES ($1, $2, $3, $4)
+           ON CONFLICT (guild_id, message_id) DO NOTHING`,
+          [
+            message.guildId,
+            sentMessage.id,
+            message.author.id,
+            profileXpPerPost,
+          ],
+        );
+      }
+      await databaseClient.query("COMMIT");
+    } catch (error) {
+      await databaseClient.query("ROLLBACK").catch(() => undefined);
+      throw error;
+    } finally {
+      databaseClient.release();
+    }
     postSaved = true;
 
     stage = "delete_original";
@@ -2176,6 +2210,7 @@ process.once("SIGTERM", () => void shutdown("SIGTERM"));
 async function main() {
   await initializeDatabase();
   await initializeDailyPostRewardTables(pool);
+  await initializeProfileTables(pool);
   stopDailyPostRewards = attachDailyPostRewards(client, pool);
   stopProfileCommand = attachProfileCommand(client, pool);
   await client.login(token);

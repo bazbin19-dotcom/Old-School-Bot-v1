@@ -1,56 +1,62 @@
 import {
+  ActionRowBuilder,
   AttachmentBuilder,
+  ButtonBuilder,
+  ButtonStyle,
   ChannelType,
+  Client,
+  ContainerBuilder,
   EmbedBuilder,
   Events,
-  type Client,
+  MediaGalleryBuilder,
+  MessageFlags,
+  ModalBuilder,
+  SeparatorBuilder,
+  SeparatorSpacingSize,
+  StringSelectMenuBuilder,
+  TextInputBuilder,
+  TextInputStyle,
+  type ButtonInteraction,
+  type Interaction,
   type Message,
+  type ModalSubmitInteraction,
+  type StringSelectMenuInteraction,
   type TextChannel,
 } from "discord.js";
-import sharp from "sharp";
 import type { Pool } from "pg";
+import { renderProfileCard, type ProfileCardInput } from "./profile-card.js";
+import {
+  backfillProfileXpAwards,
+  getProfileCounts,
+  getProfilePostPage,
+  getProfileSettings,
+  getProfileXp,
+  getProfileUserList,
+  initializeProfileTables,
+  profileDefaultBackground,
+  profileImagePostChannelId,
+  setProfileBackgroundColor,
+  setProfileDisplayName,
+  setProfileFollowingPrivacy,
+  toggleProfileFollow,
+  type ProfileListKind,
+  type ProfilePostRow,
+} from "./profile-store.js";
 
 const profileCommandChannelId = "1546917390405869718";
-const imagePostChannelId = "1546491043334201374";
-const profileWidth = 1590;
-const profileHeight = 1800;
-const thumbnailLimit = 6;
-const maxRemoteImageBytes = 8 * 1024 * 1024;
-const allowedImageHosts = new Set([
-  "cdn.discordapp.com",
-  "media.discordapp.net",
-]);
+const postsPerPage = 6;
+const xpRequiredPerLevel = 900;
+let profileFileSequence = 0;
 
-type ProfilePostRow = {
-  message_id: string;
-  images: string[] | string;
-  like_count: number;
-  total_posts: number;
-  total_likes: number;
+type ProfileView = {
+  ownerId: string;
+  page: number;
+  totalPages: number;
+  totalPosts: number;
+  followingCount: number;
+  followerCount: number;
+  card: ProfileCardInput;
 };
-
-type ProfilePost = {
-  imageUrl: string;
-  likeCount: number;
-};
-
-function escapeXml(value: string) {
-  return value
-    .replace(/[\u0000-\u001f\u007f]/g, "")
-    .replaceAll("&", "&amp;")
-    .replaceAll("<", "&lt;")
-    .replaceAll(">", "&gt;")
-    .replaceAll('"', "&quot;")
-    .replaceAll("'", "&apos;");
-}
-
-function displayText(value: string, maxCharacters: number) {
-  const normalized = value.trim();
-  const characters = Array.from(normalized);
-  return characters.length > maxCharacters
-    ? `${characters.slice(0, maxCharacters - 1).join("")}…`
-    : normalized;
-}
 
 function parseImageNames(images: string[] | string) {
   if (Array.isArray(images)) return images;
@@ -88,300 +94,758 @@ function getMediaGalleryUrls(components: readonly unknown[]) {
     }
     if (Array.isArray(data.components)) data.components.forEach(visit);
   };
-
   components.forEach(visit);
   return urls;
 }
 
-async function getProfilePosts(
-  client: Client,
-  pool: Pool,
-  userId: string,
-): Promise<{ posts: ProfilePost[]; totalPosts: number; totalLikes: number }> {
-  const result = await pool.query<ProfilePostRow>(
-    `WITH post_likes AS (
-       SELECT p.message_id,
-              p.images,
-              p.created_at,
-              COUNT(l.user_id)::int AS like_count
-       FROM discord_image_posts p
-       LEFT JOIN discord_image_post_likes l ON l.message_id = p.message_id
-       WHERE p.author_id = $1 AND p.channel_id = $2
-       GROUP BY p.message_id
-     )
-     SELECT message_id,
-            images,
-            like_count,
-            COUNT(*) OVER()::int AS total_posts,
-            SUM(like_count) OVER()::int AS total_likes
-     FROM post_likes
-     ORDER BY created_at DESC
-     LIMIT $3`,
-    [userId, imagePostChannelId, thumbnailLimit],
-  );
-
-  const totalPosts = result.rows[0]?.total_posts ?? 0;
-  const totalLikes = result.rows[0]?.total_likes ?? 0;
-  if (result.rows.length === 0) {
-    return { posts: [], totalPosts, totalLikes };
-  }
-
-  const channel = await client.channels.fetch(imagePostChannelId);
-  if (!channel || channel.type !== ChannelType.GuildText) {
-    throw new Error("The configured image-post channel is unavailable.");
-  }
-
-  const posts: ProfilePost[] = [];
-  for (const row of result.rows) {
-    const imageNames = parseImageNames(row.images);
-    if (imageNames.length === 0) continue;
-
-    try {
-      const message = await (channel as TextChannel).messages.fetch({
-        message: row.message_id,
-        force: true,
-      });
-      const attachmentList = [...message.attachments.values()];
-      const attachment =
-        message.attachments.find((item) => item.name === imageNames[0]) ??
-        attachmentList[0];
-      const galleryUrl = getMediaGalleryUrls(message.components)[0];
-      const embeddedImageUrl = message.embeds[0]?.image?.url;
-      const imageUrl = attachment?.url ?? galleryUrl ?? embeddedImageUrl;
-      if (imageUrl && !imageUrl.startsWith("attachment://")) {
-        posts.push({ imageUrl, likeCount: row.like_count });
-      }
-    } catch {
-      // A post may have been deleted outside the bot; leave its tile empty.
-    }
-  }
-
-  return { posts, totalPosts, totalLikes };
-}
-
-async function fetchDiscordImage(url: string) {
-  const parsedUrl = new URL(url);
-  if (parsedUrl.protocol !== "https:" || !allowedImageHosts.has(parsedUrl.hostname)) {
-    throw new Error("Profile images must come from Discord's CDN.");
-  }
-
-  const response = await fetch(parsedUrl, {
-    signal: AbortSignal.timeout(12_000),
-  });
-  if (!response.ok) throw new Error("A profile image could not be downloaded.");
-
-  const declaredSize = Number(response.headers.get("content-length") ?? 0);
-  if (declaredSize > maxRemoteImageBytes) {
-    throw new Error("A profile image exceeds the supported size.");
-  }
-
-  const buffer = Buffer.from(await response.arrayBuffer());
-  if (buffer.byteLength === 0 || buffer.byteLength > maxRemoteImageBytes) {
-    throw new Error("A profile image has an unsupported size.");
-  }
-  return buffer;
-}
-
-async function resizeImage(url: string, width: number, height: number) {
-  const buffer = await fetchDiscordImage(url);
-  const resized = await sharp(buffer, { limitInputPixels: 50_000_000 })
-    .rotate()
-    .resize(width, height, { fit: "cover", position: "attention" })
-    .jpeg({ quality: 84 })
-    .toBuffer();
-  return `data:image/jpeg;base64,${resized.toString("base64")}`;
-}
-
-export function buildProfileSvg(
-  displayName: string,
-  username: string,
-  avatarData: string,
-  bannerData: string | null,
-  totalPosts: number,
-  totalLikes: number,
-  postImages: Array<{ imageData: string | null; likeCount: number }>,
+function logProfileError(
+  event: string,
+  error: unknown,
+  details: Record<string, string> = {},
 ) {
-  const tileWidth = 390;
-  const tileHeight = 382;
-  const xPositions = [178, 600, 1022];
-  const yPositions = [924, 1336];
-  const tiles = Array.from({ length: thumbnailLimit }, (_, index) => {
-    const x = xPositions[index % 3];
-    const y = yPositions[Math.floor(index / 3)];
-    const post = postImages[index];
-    const clipId = `post-tile-${index}`;
-
-    if (!post?.imageData) {
-      return `<g>
-        <rect x="${x}" y="${y}" width="${tileWidth}" height="${tileHeight}" rx="36" fill="#252527"/>
-        <text x="${x + tileWidth / 2}" y="${y + tileHeight / 2 + 34}" text-anchor="middle"
-          fill="#414144" font-family="Arial, sans-serif" font-size="112" font-weight="700">+</text>
-      </g>`;
-    }
-
-    const likeBadgeWidth = post.likeCount > 999 ? 152 : 130;
-    return `<g clip-path="url(#${clipId})">
-      <image x="${x}" y="${y}" width="${tileWidth}" height="${tileHeight}"
-        href="${post.imageData}" preserveAspectRatio="xMidYMid slice"/>
-      <rect x="${x}" y="${y + tileHeight - 120}" width="${tileWidth}" height="120"
-        fill="url(#tile-fade)"/>
-      <rect x="${x + 18}" y="${y + tileHeight - 73}" width="${likeBadgeWidth}" height="52"
-        rx="26" fill="#111214" fill-opacity=".88"/>
-      <text x="${x + 38}" y="${y + tileHeight - 37}" fill="#ff5665"
-        font-family="Arial, sans-serif" font-size="29">♥</text>
-      <text x="${x + 77}" y="${y + tileHeight - 37}" fill="#ffffff"
-        font-family="Arial, sans-serif" font-size="25" font-weight="700">${post.likeCount}</text>
-    </g>`;
-  }).join("");
-
-  const clipPaths = Array.from({ length: thumbnailLimit }, (_, index) => {
-    const x = xPositions[index % 3];
-    const y = yPositions[Math.floor(index / 3)];
-    return `<clipPath id="post-tile-${index}">
-      <rect x="${x}" y="${y}" width="${tileWidth}" height="${tileHeight}" rx="36"/>
-    </clipPath>`;
-  }).join("");
-
-  const safeDisplayName = escapeXml(displayText(displayName, 34) || "Discord Member");
-  const safeUsername = escapeXml(displayText(`@${username}`, 36));
-  const bannerLayer = bannerData
-    ? `<image x="34" y="34" width="1522" height="508" href="${bannerData}"
-         preserveAspectRatio="xMidYMid slice" clip-path="url(#banner-clip)"/>`
-    : `<rect x="34" y="34" width="1522" height="508" rx="62" fill="url(#banner-fallback)"/>`;
-
-  return `<svg xmlns="http://www.w3.org/2000/svg" width="${profileWidth}" height="${profileHeight}" viewBox="0 0 ${profileWidth} ${profileHeight}">
-    <defs>
-      <linearGradient id="page-bg" x1="0" y1="0" x2="0" y2="1">
-        <stop offset="0" stop-color="#3a3a3d"/>
-        <stop offset=".48" stop-color="#202023"/>
-        <stop offset="1" stop-color="#09090a"/>
-      </linearGradient>
-      <linearGradient id="banner-fallback" x1="0" y1="0" x2="1" y2="1">
-        <stop offset="0" stop-color="#303034"/>
-        <stop offset=".56" stop-color="#111113"/>
-        <stop offset="1" stop-color="#070708"/>
-      </linearGradient>
-      <linearGradient id="banner-shade" x1="0" y1="0" x2="0" y2="1">
-        <stop offset="0" stop-color="#000000" stop-opacity=".15"/>
-        <stop offset="1" stop-color="#000000" stop-opacity=".42"/>
-      </linearGradient>
-      <linearGradient id="tile-fade" x1="0" y1="0" x2="0" y2="1">
-        <stop offset="0" stop-color="#000000" stop-opacity="0"/>
-        <stop offset="1" stop-color="#000000" stop-opacity=".72"/>
-      </linearGradient>
-      <linearGradient id="stats-panel" x1="0" y1="0" x2="0" y2="1">
-        <stop offset="0" stop-color="#2b2b2e"/>
-        <stop offset="1" stop-color="#18181a"/>
-      </linearGradient>
-      <clipPath id="name-clip"><rect x="578" y="566" width="690" height="82"/></clipPath>
-      <clipPath id="banner-clip"><rect x="34" y="34" width="1522" height="508" rx="62"/></clipPath>
-      <clipPath id="avatar-clip"><circle cx="292" cy="500" r="210"/></clipPath>
-      ${clipPaths}
-    </defs>
-    <rect width="${profileWidth}" height="${profileHeight}" fill="url(#page-bg)"/>
-    <rect x="34" y="34" width="1522" height="508" rx="62" fill="#080809"/>
-    ${bannerLayer}
-    <rect x="34" y="34" width="1522" height="508" rx="62" fill="url(#banner-shade)" clip-path="url(#banner-clip)"/>
-
-    <rect x="535" y="546" width="1021" height="190" rx="42" fill="#2b2b2e"/>
-    <text x="587" y="628" fill="#ffffff" font-family="Arial, sans-serif" font-size="58"
-      font-weight="700" clip-path="url(#name-clip)">${safeDisplayName}</text>
-    <text x="590" y="686" fill="#b5b5bb" font-family="Arial, sans-serif" font-size="25">${safeUsername}</text>
-    <rect x="1290" y="578" width="218" height="48" rx="24" fill="#37373b"/>
-    <text x="1399" y="610" text-anchor="middle" fill="#d4d4d8"
-      font-family="Arial, sans-serif" font-size="18" font-weight="700" letter-spacing="2">PROFILE</text>
-
-    <circle cx="292" cy="500" r="222" fill="#414144"/>
-    <image x="82" y="290" width="420" height="420" href="${avatarData}"
-      preserveAspectRatio="xMidYMid slice" clip-path="url(#avatar-clip)"/>
-
-    <rect x="34" y="755" width="1522" height="1017" rx="46" fill="url(#stats-panel)"/>
-    <text x="520" y="842" text-anchor="middle" fill="#ffd33d"
-      font-family="Arial, sans-serif" font-size="66" font-weight="700">${totalPosts}</text>
-    <text x="520" y="894" text-anchor="middle" fill="#a6a6ac"
-      font-family="Arial, sans-serif" font-size="34">Posts</text>
-    <text x="1090" y="842" text-anchor="middle" fill="#43cce5"
-      font-family="Arial, sans-serif" font-size="66" font-weight="700">${totalLikes}</text>
-    <text x="1090" y="894" text-anchor="middle" fill="#a6a6ac"
-      font-family="Arial, sans-serif" font-size="34">Likes received</text>
-    ${tiles}
-  </svg>`;
-}
-
-async function mapWithConcurrency<T, R>(
-  items: T[],
-  concurrency: number,
-  operation: (item: T) => Promise<R>,
-) {
-  const results = new Array<R>(items.length);
-  let nextIndex = 0;
-  const workers = Array.from(
-    { length: Math.min(concurrency, items.length) },
-    async () => {
-      while (nextIndex < items.length) {
-        const index = nextIndex;
-        nextIndex += 1;
-        results[index] = await operation(items[index]);
-      }
-    },
-  );
-  await Promise.all(workers);
-  return results;
-}
-
-async function renderProfile(
-  client: Client,
-  pool: Pool,
-  message: Message,
-) {
-  const user = await message.author.fetch(true);
-  const displayName =
-    message.member?.displayName ?? user.globalName ?? user.username;
-  const avatarUrl = user.displayAvatarURL({ extension: "png", size: 512 });
-  const bannerUrl = user.bannerURL({ extension: "png", size: 1024 }) ?? null;
-  const profilePosts = await getProfilePosts(client, pool, user.id);
-
-  const [avatarData, bannerData, postData] = await Promise.all([
-    resizeImage(avatarUrl, 600, 600),
-    bannerUrl ? resizeImage(bannerUrl, 1600, 540) : Promise.resolve(null),
-    mapWithConcurrency(profilePosts.posts, 3, async (post) => ({
-      imageData: await resizeImage(post.imageUrl, 520, 510),
-      likeCount: post.likeCount,
-    })),
-  ]);
-
-  const svg = buildProfileSvg(
-    displayName,
-    user.username,
-    avatarData,
-    bannerData,
-    profilePosts.totalPosts,
-    profilePosts.totalLikes,
-    postData,
-  );
-  return sharp(Buffer.from(svg), { density: 96 })
-    .png({ compressionLevel: 8 })
-    .toBuffer();
-}
-
-function logProfileError(error: unknown, message: Message) {
-  const details =
+  const info =
     error && typeof error === "object"
       ? (error as { name?: unknown; code?: unknown })
       : {};
   process.stderr.write(
     `${JSON.stringify({
       level: "error",
-      event: "profile_image_generation_failed",
+      event,
       timestamp: new Date().toISOString(),
-      userId: message.author.id,
-      channelId: message.channelId,
-      errorName: typeof details.name === "string" ? details.name : "Error",
-      ...(details.code !== undefined
-        ? { errorCode: String(details.code) }
-        : {}),
+      ...details,
+      errorName: typeof info.name === "string" ? info.name : "Error",
+      ...(info.code !== undefined ? { errorCode: String(info.code) } : {}),
     })}\n`,
   );
+}
+
+function isProfileSnowflake(value: string | undefined): value is string {
+  return Boolean(value && /^\d{17,20}$/.test(value));
+}
+
+function parsePage(value: string | undefined) {
+  if (!value || !/^\d+$/.test(value)) return 0;
+  const parsed = Number(value);
+  return Number.isSafeInteger(parsed) ? Math.min(parsed, 100_000) : 0;
+}
+
+async function resolvePostImage(
+  channel: TextChannel,
+  row: ProfilePostRow,
+): Promise<string | null> {
+  const imageNames = parseImageNames(row.images);
+  if (imageNames.length === 0) return null;
+
+  try {
+    const message = await channel.messages.fetch({
+      message: row.message_id,
+      force: true,
+    });
+    const attachmentList = [...message.attachments.values()];
+    const attachment =
+      message.attachments.find((item) => item.name === imageNames[0]) ??
+      attachmentList[0];
+    const galleryUrl = getMediaGalleryUrls(message.components)[0];
+    const embeddedImageUrl = message.embeds[0]?.image?.url;
+    const imageUrl = attachment?.url ?? galleryUrl ?? embeddedImageUrl;
+    return imageUrl && !imageUrl.startsWith("attachment://") ? imageUrl : null;
+  } catch {
+    // A post may have been deleted outside the bot; show an empty tile for it.
+    return null;
+  }
+}
+
+async function loadProfileView(
+  client: Client,
+  pool: Pool,
+  guildId: string,
+  ownerId: string,
+  requestedPage: number,
+): Promise<ProfileView> {
+  await backfillProfileXpAwards(pool, guildId, ownerId);
+  const [settings, counts, totalXp, guild, fetchedUser] = await Promise.all([
+    getProfileSettings(pool, guildId, ownerId),
+    getProfileCounts(pool, guildId, ownerId),
+    getProfileXp(pool, guildId, ownerId),
+    client.guilds.fetch(guildId),
+    client.users.fetch(ownerId),
+  ]);
+  const user = await fetchedUser.fetch(true);
+  const member = await guild.members.fetch(ownerId).catch(() => null);
+  const totalPages = Math.max(1, Math.ceil(counts.totalPosts / postsPerPage));
+  const page = Math.min(Math.max(0, requestedPage), totalPages - 1);
+  const pageRows = await getProfilePostPage(pool, ownerId, page, postsPerPage);
+
+  let postChannel: TextChannel | null = null;
+  if (pageRows.rows.length > 0) {
+    const fetchedChannel = await client.channels.fetch(profileImagePostChannelId);
+    if (!fetchedChannel || fetchedChannel.type !== ChannelType.GuildText) {
+      throw new Error("The configured image-post channel is unavailable.");
+    }
+    postChannel = fetchedChannel;
+  }
+
+  const posts = await Promise.all(
+    pageRows.rows.map(async (row) => ({
+      imageUrl: postChannel ? await resolvePostImage(postChannel, row) : null,
+      likeCount: row.like_count,
+    })),
+  );
+
+  const level = Math.floor(totalXp / xpRequiredPerLevel) + 1;
+  const nextLevelXp = level * xpRequiredPerLevel;
+  const displayName =
+    settings.display_name?.trim() ||
+    member?.displayName ||
+    user.globalName ||
+    user.username;
+
+  return {
+    ownerId,
+    page,
+    totalPages,
+    totalPosts: counts.totalPosts,
+    followingCount: counts.followingCount,
+    followerCount: counts.followerCount,
+    card: {
+      displayName,
+      avatarUrl: user.displayAvatarURL({ extension: "png", size: 512 }),
+      bannerUrl: user.bannerURL({ extension: "png", size: 1024 }) ?? null,
+      backgroundColor: settings.background_color || profileDefaultBackground,
+      totalPosts: counts.totalPosts,
+      followingCount: counts.followingCount,
+      followerCount: counts.followerCount,
+      currentXp: totalXp,
+      level,
+      nextLevelXp,
+      posts,
+    },
+  };
+}
+
+function buildProfileButtons(view: ProfileView) {
+  const buttons: ButtonBuilder[] = [];
+  if (view.totalPosts > postsPerPage) {
+    buttons.push(
+      new ButtonBuilder()
+        .setCustomId(`profile:page:${view.ownerId}:${Math.max(0, view.page - 1)}`)
+        .setEmoji("⬅️")
+        .setLabel("السابق")
+        .setStyle(ButtonStyle.Secondary)
+        .setDisabled(view.page === 0),
+    );
+  }
+
+  buttons.push(
+    new ButtonBuilder()
+      .setCustomId(`profile:follow:${view.ownerId}:${view.page}`)
+      .setLabel("Follow")
+      .setStyle(ButtonStyle.Primary),
+    new ButtonBuilder()
+      .setCustomId(`profile:following:${view.ownerId}`)
+      .setLabel(`Following · ${view.followingCount}`)
+      .setEmoji("➡️")
+      .setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder()
+      .setCustomId(`profile:followers:${view.ownerId}`)
+      .setLabel(`Followers · ${view.followerCount}`)
+      .setEmoji("👥")
+      .setStyle(ButtonStyle.Secondary),
+  );
+
+  if (view.totalPosts > postsPerPage) {
+    buttons.push(
+      new ButtonBuilder()
+        .setCustomId(
+          `profile:page:${view.ownerId}:${Math.min(view.totalPages - 1, view.page + 1)}`,
+        )
+        .setEmoji("➡️")
+        .setLabel("التالي")
+        .setStyle(ButtonStyle.Secondary)
+        .setDisabled(view.page >= view.totalPages - 1),
+    );
+  }
+
+  const settingsRow = new ActionRowBuilder<ButtonBuilder>().addComponents(
+    new ButtonBuilder()
+      .setCustomId(`profile:settings:${view.ownerId}:${view.page}`)
+      .setEmoji("⚙️")
+      .setLabel("الإعدادات")
+      .setStyle(ButtonStyle.Secondary),
+  );
+
+  return {
+    profileRow: new ActionRowBuilder<ButtonBuilder>().addComponents(buttons),
+    settingsRow,
+  };
+}
+
+function buildProfileContainer(view: ProfileView, imageUrl: string) {
+  const buttons = buildProfileButtons(view);
+  return new ContainerBuilder()
+    .setAccentColor(0x45454c)
+    .addMediaGalleryComponents(
+      new MediaGalleryBuilder().addItems({ media: { url: imageUrl } }),
+    )
+    .addSeparatorComponents(
+      new SeparatorBuilder()
+        .setDivider(true)
+        .setSpacing(SeparatorSpacingSize.Small),
+    )
+    .addActionRowComponents(buttons.profileRow)
+    .addActionRowComponents(buttons.settingsRow);
+}
+
+function createProfileFileName(ownerId: string) {
+  profileFileSequence += 1;
+  return `profile-${ownerId}-${Date.now()}-${profileFileSequence}.png`;
+}
+
+async function sendProfileMessage(
+  commandMessage: Message,
+  client: Client,
+  pool: Pool,
+) {
+  if (!commandMessage.guildId) {
+    throw new Error("Profile command must be used in a server.");
+  }
+  const view = await loadProfileView(
+    client,
+    pool,
+    commandMessage.guildId,
+    commandMessage.author.id,
+    0,
+  );
+  const image = await renderProfileCard(view.card);
+  const fileName = createProfileFileName(view.ownerId);
+
+  await commandMessage.reply({
+    components: [
+      buildProfileContainer(view, `attachment://${fileName}`),
+    ],
+    flags: MessageFlags.IsComponentsV2,
+    files: [new AttachmentBuilder(image, { name: fileName })],
+    allowedMentions: { parse: [], repliedUser: false },
+  });
+}
+
+async function fetchProfilePublicMessage(
+  client: Client,
+  guildId: string,
+  messageId: string,
+) {
+  const channel = await client.channels.fetch(profileCommandChannelId);
+  if (
+    !channel ||
+    channel.type !== ChannelType.GuildText ||
+    channel.guildId !== guildId
+  ) {
+    return null;
+  }
+
+  const message = await channel.messages.fetch(messageId).catch(() => null);
+  if (!message || message.author.id !== client.user?.id) return null;
+  return message;
+}
+
+async function replaceProfileImage(
+  message: Message,
+  view: ProfileView,
+  image: Buffer,
+) {
+  const fileName = createProfileFileName(view.ownerId);
+  const existingAttachments = [...message.attachments.values()].map(
+    (attachment) => ({ id: attachment.id }),
+  );
+  const uploadedMessage = await message.edit({
+    files: [new AttachmentBuilder(image, { name: fileName })],
+    ...(existingAttachments.length > 0
+      ? { attachments: existingAttachments }
+      : {}),
+  });
+
+  let newAttachment = uploadedMessage.attachments.find(
+    (attachment) => attachment.name === fileName,
+  );
+  if (!newAttachment) {
+    const attachments = [...uploadedMessage.attachments.values()];
+    newAttachment = attachments[attachments.length - 1];
+  }
+  if (!newAttachment) {
+    throw new Error("The updated profile image attachment was not returned.");
+  }
+
+  await uploadedMessage.edit({
+    components: [buildProfileContainer(view, newAttachment.url)],
+    attachments: [{ id: newAttachment.id }],
+  });
+}
+
+async function refreshProfileMessage(
+  client: Client,
+  pool: Pool,
+  message: Message,
+  guildId: string,
+  ownerId: string,
+  requestedPage: number,
+) {
+  const view = await loadProfileView(
+    client,
+    pool,
+    guildId,
+    ownerId,
+    requestedPage,
+  );
+  const image = await renderProfileCard(view.card);
+  await replaceProfileImage(message, view, image);
+}
+
+function makeProfileSettingsMenu(
+  ownerId: string,
+  profileMessageId: string,
+  page: number,
+  followingPrivate: boolean,
+) {
+  const menu = new StringSelectMenuBuilder()
+    .setCustomId(
+      `profile:setting:${ownerId}:${profileMessageId}:${page}`,
+    )
+    .setPlaceholder("اختر إعداداً")
+    .addOptions(
+      {
+        label: followingPrivate
+          ? "إظهار قائمة Following للآخرين"
+          : "إخفاء قائمة Following عن الآخرين",
+        description: "تغيير من يستطيع رؤية قائمة الحسابات التي تتابعها",
+        value: "privacy",
+      },
+      {
+        label: "تغيير اسم العرض",
+        description: "اسم يظهر في ملفك فقط، دون تغيير اسم Discord",
+        value: "name",
+      },
+      {
+        label: "تغيير لون الخلفية",
+        description: "اكتب اسم لون أو رمز HEX",
+        value: "color",
+      },
+    );
+  return new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(menu);
+}
+
+function makeProfileNameModal(
+  ownerId: string,
+  profileMessageId: string,
+  page: number,
+) {
+  const input = new TextInputBuilder()
+    .setCustomId("profile_display_name")
+    .setLabel("اسم العرض في الملف الشخصي")
+    .setStyle(TextInputStyle.Short)
+    .setRequired(false)
+    .setMaxLength(32);
+  return new ModalBuilder()
+    .setCustomId(
+      `profile:edit:name:${ownerId}:${profileMessageId}:${page}`,
+    )
+    .setTitle("تغيير اسم الملف الشخصي")
+    .addComponents(new ActionRowBuilder<TextInputBuilder>().addComponents(input));
+}
+
+function makeProfileColorModal(
+  ownerId: string,
+  profileMessageId: string,
+  page: number,
+) {
+  const input = new TextInputBuilder()
+    .setCustomId("profile_background_color")
+    .setLabel("اسم اللون أو رمز HEX")
+    .setPlaceholder("أحمر، أزرق، بنفسجي، أو #3498DB")
+    .setStyle(TextInputStyle.Short)
+    .setRequired(true)
+    .setMaxLength(24);
+  return new ModalBuilder()
+    .setCustomId(
+      `profile:edit:color:${ownerId}:${profileMessageId}:${page}`,
+    )
+    .setTitle("تغيير لون الخلفية")
+    .addComponents(new ActionRowBuilder<TextInputBuilder>().addComponents(input));
+}
+
+function normalizeBackgroundColor(value: string) {
+  const normalized = value
+    .trim()
+    .toLowerCase()
+    .normalize("NFKD")
+    .replace(/\p{M}/gu, "")
+    .replace(/\s+/g, " ");
+  const palette: Record<string, string> = {
+    red: "#D84F61",
+    blue: "#397BD1",
+    green: "#32A36B",
+    yellow: "#D6A931",
+    purple: "#8255BB",
+    violet: "#8255BB",
+    orange: "#D58137",
+    pink: "#D75795",
+    black: "#17171A",
+    white: "#E6E6E9",
+    gray: "#65656B",
+    grey: "#65656B",
+    cyan: "#22A9BA",
+    teal: "#238E8D",
+    brown: "#8A5F44",
+    احمر: "#D84F61",
+    ازرق: "#397BD1",
+    اخضر: "#32A36B",
+    اصفر: "#D6A931",
+    بنفسجي: "#8255BB",
+    برتقالي: "#D58137",
+    وردي: "#D75795",
+    اسود: "#17171A",
+    ابيض: "#E6E6E9",
+    رمادي: "#65656B",
+    سماوي: "#22A9BA",
+    بني: "#8A5F44",
+  };
+  const namedColor = palette[normalized];
+  if (namedColor) return namedColor;
+
+  const hex = normalized.startsWith("#") ? normalized : `#${normalized}`;
+  return /^#[0-9a-f]{6}$/i.test(hex) ? hex.toUpperCase() : null;
+}
+
+async function replyPrivately(
+  interaction:
+    | ButtonInteraction
+    | StringSelectMenuInteraction
+    | ModalSubmitInteraction,
+  content: string,
+) {
+  if (interaction.deferred || interaction.replied) {
+    await interaction.followUp({
+      content,
+      ephemeral: true,
+      allowedMentions: { parse: [] },
+    });
+  } else {
+    await interaction.reply({
+      content,
+      ephemeral: true,
+      allowedMentions: { parse: [] },
+    });
+  }
+}
+
+function isProfilePublicButton(
+  client: Client,
+  interaction: ButtonInteraction,
+) {
+  return (
+    interaction.channelId === profileCommandChannelId &&
+    interaction.guildId !== null &&
+    interaction.message.author.id === client.user?.id
+  );
+}
+
+async function handleProfileButton(
+  client: Client,
+  pool: Pool,
+  interaction: ButtonInteraction,
+) {
+  const [prefix, action, ownerId, value] = interaction.customId.split(":");
+  if (prefix !== "profile" || !action || !isProfileSnowflake(ownerId)) return;
+  if (!isProfilePublicButton(client, interaction)) {
+    await replyPrivately(interaction, "هذا الملف الشخصي لم يعد متاحاً.");
+    return;
+  }
+  const guildId = interaction.guildId;
+  if (!guildId) {
+    await replyPrivately(interaction, "يجب استخدام هذا الخيار داخل السيرفر.");
+    return;
+  }
+
+  if (action === "page") {
+    await interaction.deferUpdate();
+    await refreshProfileMessage(
+      client,
+      pool,
+      interaction.message,
+      guildId,
+      ownerId,
+      parsePage(value),
+    );
+    return;
+  }
+
+  if (action === "follow") {
+    if (ownerId === interaction.user.id) {
+      await replyPrivately(interaction, "لا يمكنك متابعة ملفك الشخصي.");
+      return;
+    }
+    await interaction.deferUpdate();
+    const isFollowing = await toggleProfileFollow(
+      pool,
+      guildId,
+      interaction.user.id,
+      ownerId,
+    );
+    await refreshProfileMessage(
+      client,
+      pool,
+      interaction.message,
+      guildId,
+      ownerId,
+      parsePage(value),
+    );
+    await interaction.followUp({
+      content: isFollowing
+        ? `أصبحت تتابع <@${ownerId}>. اضغط Follow مرة أخرى لإلغاء المتابعة.`
+        : `ألغيت متابعة <@${ownerId}>.`,
+      ephemeral: true,
+      allowedMentions: { parse: [] },
+    });
+    return;
+  }
+
+  if (action === "following" || action === "followers") {
+    await interaction.deferReply({ ephemeral: true });
+    const kind = action as ProfileListKind;
+    const settings = await getProfileSettings(pool, guildId, ownerId);
+    if (
+      kind === "following" &&
+      settings.following_private &&
+      interaction.user.id !== ownerId
+    ) {
+      await interaction.editReply("قائمة Following مخفية من صاحب الملف الشخصي.");
+      return;
+    }
+
+    const list = await getProfileUserList(pool, guildId, ownerId, kind);
+    if (list.totalCount === 0) {
+      await interaction.editReply(
+        kind === "following"
+          ? "هذا الحساب لا يتابع أحداً حالياً."
+          : "هذا الحساب ليس لديه متابعون بعد.",
+      );
+      return;
+    }
+
+    const names = list.userIds.map((userId) => `<@${userId}>`);
+    const extraCount = list.totalCount - names.length;
+    const description = [
+      names.join("\n"),
+      extraCount > 0 ? `و${extraCount} حساباً آخر` : "",
+    ]
+      .filter(Boolean)
+      .join("\n");
+    const embed = new EmbedBuilder()
+      .setColor(0x39393d)
+      .setTitle(
+        kind === "following"
+          ? `Following · ${list.totalCount}`
+          : `Followers · ${list.totalCount}`,
+      )
+      .setDescription(description);
+    await interaction.editReply({
+      embeds: [embed],
+      allowedMentions: { parse: [] },
+    });
+    return;
+  }
+
+  if (action === "settings") {
+    if (interaction.user.id !== ownerId) {
+      await replyPrivately(
+        interaction,
+        "إعدادات الملف الشخصي متاحة لصاحبه فقط.",
+      );
+      return;
+    }
+    const settings = await getProfileSettings(pool, guildId, ownerId);
+    await interaction.reply({
+      content: "إعدادات الملف الشخصي",
+      components: [
+        makeProfileSettingsMenu(
+          ownerId,
+          interaction.message.id,
+          parsePage(value),
+          settings.following_private,
+        ),
+      ],
+      ephemeral: true,
+      allowedMentions: { parse: [] },
+    });
+  }
+}
+
+async function handleProfileSelect(
+  client: Client,
+  pool: Pool,
+  interaction: StringSelectMenuInteraction,
+) {
+  const [prefix, action, ownerId, profileMessageId, pageValue] =
+    interaction.customId.split(":");
+  if (
+    prefix !== "profile" ||
+    action !== "setting" ||
+    !isProfileSnowflake(ownerId) ||
+    !isProfileSnowflake(profileMessageId)
+  ) {
+    return;
+  }
+
+  if (
+    interaction.channelId !== profileCommandChannelId ||
+    !interaction.guildId ||
+    interaction.user.id !== ownerId ||
+    interaction.message.author.id !== client.user?.id
+  ) {
+    await replyPrivately(
+      interaction,
+      "هذه الإعدادات غير متاحة لهذا الحساب أو لم تعد صالحة.",
+    );
+    return;
+  }
+  const selected = interaction.values[0];
+  if (selected === "privacy") {
+    await interaction.deferUpdate();
+    const profileMessage = await fetchProfilePublicMessage(
+      client,
+      interaction.guildId,
+      profileMessageId,
+    );
+    if (!profileMessage) {
+      await interaction.editReply({
+        content: "تعذر العثور على رسالة الملف الشخصي.",
+        components: [],
+      });
+      return;
+    }
+    const settings = await getProfileSettings(pool, interaction.guildId, ownerId);
+    const nextPrivacy = !settings.following_private;
+    await setProfileFollowingPrivacy(
+      pool,
+      interaction.guildId,
+      ownerId,
+      nextPrivacy,
+    );
+    await interaction.editReply({
+      content: nextPrivacy
+        ? "تم إخفاء قائمة Following عن بقية الأعضاء."
+        : "أصبحت قائمة Following ظاهرة لبقية الأعضاء.",
+      components: [],
+    });
+    return;
+  }
+
+  if (selected === "name") {
+    await interaction.showModal(
+      makeProfileNameModal(
+        ownerId,
+        profileMessageId,
+        parsePage(pageValue),
+      ),
+    );
+  } else if (selected === "color") {
+    await interaction.showModal(
+      makeProfileColorModal(
+        ownerId,
+        profileMessageId,
+        parsePage(pageValue),
+      ),
+    );
+  }
+}
+
+async function handleProfileModal(
+  client: Client,
+  pool: Pool,
+  interaction: ModalSubmitInteraction,
+) {
+  const [prefix, action, setting, ownerId, profileMessageId, pageValue] =
+    interaction.customId.split(":");
+  if (
+    prefix !== "profile" ||
+    action !== "edit" ||
+    !["name", "color"].includes(setting ?? "") ||
+    !isProfileSnowflake(ownerId) ||
+    !isProfileSnowflake(profileMessageId)
+  ) {
+    return;
+  }
+
+  if (
+    interaction.channelId !== profileCommandChannelId ||
+    !interaction.guildId ||
+    interaction.user.id !== ownerId
+  ) {
+    await replyPrivately(
+      interaction,
+      "لا يمكنك تعديل إعدادات ملف شخصي لا تملكه.",
+    );
+    return;
+  }
+  await interaction.deferReply({ ephemeral: true });
+  const profileMessage = await fetchProfilePublicMessage(
+    client,
+    interaction.guildId,
+    profileMessageId,
+  );
+  if (!profileMessage) {
+    await interaction.editReply("تعذر العثور على رسالة الملف الشخصي.");
+    return;
+  }
+
+  if (setting === "name") {
+    const name = interaction.fields
+      .getTextInputValue("profile_display_name")
+      .trim();
+    if (Array.from(name).length > 32) {
+      await interaction.editReply("يجب أن يكون الاسم أقصر من 33 حرفاً.");
+      return;
+    }
+    await setProfileDisplayName(
+      pool,
+      interaction.guildId,
+      ownerId,
+      name || null,
+    );
+    await refreshProfileMessage(
+      client,
+      pool,
+      profileMessage,
+      interaction.guildId,
+      ownerId,
+      parsePage(pageValue),
+    );
+    await interaction.editReply(
+      name
+        ? "تم تحديث اسم العرض في ملفك الشخصي."
+        : "تمت إعادة اسم العرض إلى اسمك في السيرفر.",
+    );
+    return;
+  }
+
+  const color = normalizeBackgroundColor(
+    interaction.fields.getTextInputValue("profile_background_color"),
+  );
+  if (!color) {
+    await interaction.editReply(
+      "لم أتعرف على اللون. جرّب اسماً مثل أحمر أو أزرق أو بنفسجي، أو اكتب رمزاً مثل #3498DB.",
+    );
+    return;
+  }
+  await setProfileBackgroundColor(pool, interaction.guildId, ownerId, color);
+  await refreshProfileMessage(
+    client,
+    pool,
+    profileMessage,
+    interaction.guildId,
+    ownerId,
+    parsePage(pageValue),
+  );
+  await interaction.editReply(`تم تغيير لون خلفية الملف إلى ${color}.`);
 }
 
 export function attachProfileCommand(client: Client, pool: Pool) {
@@ -395,31 +859,68 @@ export function attachProfileCommand(client: Client, pool: Pool) {
       return;
     }
 
-    void renderProfile(client, pool, message)
-      .then(async (image) => {
-        const fileName = `profile-${message.author.id}.png`;
-        const embed = new EmbedBuilder()
-          .setColor(0x29292c)
-          .setTitle(`الملف الشخصي · ${message.member?.displayName ?? message.author.username}`)
-          .setImage(`attachment://${fileName}`);
-
-        await message.reply({
-          embeds: [embed],
-          files: [new AttachmentBuilder(image, { name: fileName })],
-          allowedMentions: { repliedUser: false },
-        });
-      })
-      .catch(async (error: unknown) => {
-        logProfileError(error, message);
-        await message
-          .reply({
-            content: "تعذر إنشاء الملف الشخصي حالياً. حاول مرة أخرى بعد قليل.",
-            allowedMentions: { repliedUser: false },
-          })
-          .catch(() => null);
+    void sendProfileMessage(message, client, pool).catch(async (error: unknown) => {
+      logProfileError("profile_image_generation_failed", error, {
+        userId: message.author.id,
+        channelId: message.channelId,
       });
+      await message
+        .reply({
+          content: "تعذر إنشاء الملف الشخصي حالياً. حاول مرة أخرى بعد قليل.",
+          allowedMentions: { repliedUser: false },
+        })
+        .catch(() => null);
+    });
+  };
+
+  const onInteraction = (interaction: Interaction) => {
+    let action: Promise<void> | null = null;
+    let eventName = "profile_interaction_failed";
+
+    if (
+      interaction.isButton() &&
+      interaction.customId.startsWith("profile:")
+    ) {
+      action = handleProfileButton(client, pool, interaction);
+      eventName = "profile_button_failed";
+    } else if (
+      interaction.isStringSelectMenu() &&
+      interaction.customId.startsWith("profile:")
+    ) {
+      action = handleProfileSelect(client, pool, interaction);
+      eventName = "profile_settings_select_failed";
+    } else if (
+      interaction.isModalSubmit() &&
+      interaction.customId.startsWith("profile:")
+    ) {
+      action = handleProfileModal(client, pool, interaction);
+      eventName = "profile_settings_modal_failed";
+    }
+
+    if (!action) return;
+    void action.catch(async (error: unknown) => {
+      logProfileError(eventName, error, {
+        channelId: interaction.channelId ?? "unknown",
+      });
+      if (
+        interaction.isButton() ||
+        interaction.isStringSelectMenu() ||
+        interaction.isModalSubmit()
+      ) {
+        await replyPrivately(
+          interaction,
+          "تعذر تنفيذ هذا الخيار حالياً. حاول مرة أخرى.",
+        ).catch(() => null);
+      }
+    });
   };
 
   client.on(Events.MessageCreate, onMessage);
-  return () => client.off(Events.MessageCreate, onMessage);
+  client.on(Events.InteractionCreate, onInteraction);
+  return () => {
+    client.off(Events.MessageCreate, onMessage);
+    client.off(Events.InteractionCreate, onInteraction);
+  };
 }
+
+export { initializeProfileTables };
