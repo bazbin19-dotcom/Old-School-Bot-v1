@@ -2518,8 +2518,15 @@ client.once(Events.ClientReady, (readyClient) => {
   });
   let activityIndex = 0;
   const updateBotActivity = () => {
-    readyClient.user.setActivity(botActivityMessages[activityIndex], {
-      type: ActivityType.Playing,
+    readyClient.user.setPresence({
+      activities: [
+        {
+          name: "Custom Status",
+          type: ActivityType.Custom,
+          state: botActivityMessages[activityIndex],
+        },
+      ],
+      status: "online",
     });
     activityIndex = (activityIndex + 1) % botActivityMessages.length;
   };
