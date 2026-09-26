@@ -55,7 +55,10 @@ const roleCreationPromises = new Map<string, Promise<Role>>();
 let cleanupTimer: NodeJS.Timeout | undefined;
 let cleanupRunning = false;
 let maintenanceRunning = false;
+let heartbeatRunning = false;
+let botAvailabilityInitialization: Promise<void> | undefined;
 let lastNoticePruneDate: string | undefined;
+const heartbeatIntervalMs = 60_000;
 
 type DailyStreakRow = {
   streak_days: number;
@@ -159,6 +162,133 @@ function previousCalendarDate(dateString: string) {
   const date = new Date(`${dateString}T00:00:00.000Z`);
   date.setUTCDate(date.getUTCDate() - 1);
   return date.toISOString().slice(0, 10);
+}
+
+function nextCalendarDate(dateString: string) {
+  const date = new Date(`${dateString}T00:00:00.000Z`);
+  date.setUTCDate(date.getUTCDate() + 1);
+  return date.toISOString().slice(0, 10);
+}
+
+async function recordBotHeartbeat(pool: Pool) {
+  const connection = await pool.connect();
+  const now = new Date();
+  try {
+    await connection.query("BEGIN");
+    await connection.query(
+      "SELECT pg_advisory_xact_lock(1453379201)",
+    );
+    const previous = await connection.query<{
+      last_seen_at: Date;
+    }>(
+      `SELECT last_seen_at
+       FROM discord_daily_post_bot_heartbeat
+       WHERE singleton = TRUE
+       FOR UPDATE`,
+    );
+    const previousHeartbeat = previous.rows[0]?.last_seen_at;
+
+    if (
+      previousHeartbeat &&
+      now.getTime() - new Date(previousHeartbeat).getTime() >
+        heartbeatIntervalMs * 2
+    ) {
+      await connection.query(
+        `WITH outage AS (
+           SELECT $1::timestamptz AS started_at,
+                  $2::timestamptz AS ended_at
+         ),
+         local_days AS (
+           SELECT local_day::date AS outage_date,
+                  (local_day::date::timestamp AT TIME ZONE 'Asia/Baghdad')
+                    AS day_start,
+                  ((local_day::date + 1)::timestamp AT TIME ZONE 'Asia/Baghdad')
+                    AS day_end,
+                  outage.started_at,
+                  outage.ended_at
+           FROM outage
+           CROSS JOIN LATERAL generate_series(
+             (outage.started_at AT TIME ZONE 'Asia/Baghdad')::date::timestamp,
+             (outage.ended_at AT TIME ZONE 'Asia/Baghdad')::date::timestamp,
+             interval '1 day'
+           ) AS dates(local_day)
+         )
+         INSERT INTO discord_daily_post_bot_outage_days (outage_date)
+         SELECT outage_date
+         FROM local_days
+         WHERE LEAST(ended_at, day_end) > GREATEST(started_at, day_start)
+           AND EXTRACT(
+             EPOCH FROM LEAST(ended_at, day_end) - GREATEST(started_at, day_start)
+           ) >= 12 * 60 * 60
+         ON CONFLICT (outage_date) DO NOTHING`,
+        [previousHeartbeat, now],
+      );
+    }
+
+    if (previousHeartbeat) {
+      await connection.query(
+        `UPDATE discord_daily_post_bot_heartbeat
+         SET last_seen_at = $1
+         WHERE singleton = TRUE`,
+        [now],
+      );
+    } else {
+      const firstObservedDate = nextCalendarDate(baghdadDateString(now));
+      await connection.query(
+        `INSERT INTO discord_daily_post_bot_heartbeat
+           (singleton, last_seen_at, first_fully_observed_date)
+         VALUES (TRUE, $1, $2::date)
+         ON CONFLICT (singleton)
+         DO UPDATE SET last_seen_at = EXCLUDED.last_seen_at`,
+        [now, firstObservedDate],
+      );
+    }
+
+    await connection.query("COMMIT");
+  } catch (error) {
+    await connection.query("ROLLBACK").catch(() => undefined);
+    throw error;
+  } finally {
+    connection.release();
+  }
+}
+
+function ensureBotAvailabilityInitialized(pool: Pool) {
+  if (!botAvailabilityInitialization) {
+    botAvailabilityInitialization = recordBotHeartbeat(pool).catch((error) => {
+      botAvailabilityInitialization = undefined;
+      throw error;
+    });
+  }
+  return botAvailabilityInitialization;
+}
+
+async function hasObservedMissedDay(
+  pool: Pool,
+  lastPostDate: string,
+  cutoffDate: string,
+) {
+  const result = await pool.query<{ has_observed_missed_day: boolean }>(
+    `SELECT EXISTS (
+       SELECT 1
+       FROM discord_daily_post_bot_heartbeat AS heartbeat
+       CROSS JOIN LATERAL generate_series(
+         GREATEST(
+           $1::date + 1,
+           heartbeat.first_fully_observed_date
+         ),
+         $2::date,
+         interval '1 day'
+       ) AS missed_days(missed_date)
+       WHERE NOT EXISTS (
+         SELECT 1
+         FROM discord_daily_post_bot_outage_days AS outage
+         WHERE outage.outage_date = missed_days.missed_date::date
+       )
+     ) AS has_observed_missed_day`,
+    [lastPostDate, cutoffDate],
+  );
+  return result.rows[0]?.has_observed_missed_day ?? false;
 }
 
 function discordErrorCode(error: unknown) {
