@@ -71,6 +71,7 @@ const legacySeparator = "──────────────────�
 const commentInactivityMs = 5 * 60_000;
 const commentRemovalRetryMs = 60_000;
 const botActivityMessages = ["Old School", "The Best", "OS Server"] as const;
+const botStreamingUrl = "https://twitch.tv/Old_School";
 
 const pool = new Pool({ connectionString: databaseUrl });
 let stopDailyPostRewards = () => {};
@@ -2550,9 +2551,9 @@ client.once(Events.ClientReady, (readyClient) => {
     readyClient.user.setPresence({
       activities: [
         {
-          name: "Custom Status",
-          type: ActivityType.Custom,
-          state: botActivityMessages[activityIndex],
+          name: botActivityMessages[activityIndex],
+          type: ActivityType.Streaming,
+          url: botStreamingUrl,
         },
       ],
       status: "online",
