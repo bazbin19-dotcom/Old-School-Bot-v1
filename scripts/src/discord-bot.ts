@@ -70,7 +70,12 @@ const maxCaptionLength = 2_000;
 const legacySeparator = "────────────────────────────────";
 const commentInactivityMs = 5 * 60_000;
 const commentRemovalRetryMs = 60_000;
-const botActivityMessages = ["Old School", "The Best", "OS Server"] as const;
+const botActivityMessages = [
+  "⚔️ Old School",
+  "🎖️ The Best",
+  "🎯 OS Server",
+  "💞 I Love OS",
+] as const;
 const botStreamingActivityName = "Old School";
 const botStreamingUrl = "https://twitch.tv/Old_School";
 
