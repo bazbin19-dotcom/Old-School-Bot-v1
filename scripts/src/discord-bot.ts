@@ -61,7 +61,10 @@ function requireEnvironmentValue(name: string) {
 
 const token = requireEnvironmentValue("DISCORD_BOT_TOKEN");
 const channelId = requireEnvironmentValue("DISCORD_CHANNEL_ID");
-const formattedMessageChannelId = "1546491155406135296";
+const formattedMessageChannelIds = [
+  "1546491155406135296",
+  "1553714914567135312",
+] as const;
 const whisperChannelId = "1546492836592222279";
 const databaseUrl = requireEnvironmentValue("DATABASE_URL");
 const retrySourceMessageId = process.env.DISCORD_RETRY_SOURCE_MESSAGE_ID;
@@ -2085,7 +2088,9 @@ async function handleImageMessage(message: Message) {
 async function handleFormattedTextMessage(message: Message) {
   if (
     message.author.bot ||
-    message.channelId !== formattedMessageChannelId ||
+    !formattedMessageChannelIds.some(
+      (formattedChannelId) => formattedChannelId === message.channelId,
+    ) ||
     !message.inGuild() ||
     message.channel.type !== ChannelType.GuildText ||
     message.attachments.size > 0 ||
@@ -2115,7 +2120,7 @@ async function handleFormattedTextMessage(message: Message) {
     });
   } catch (error) {
     writeLog("error", "formatted_message_send_failed", {
-      channelId: formattedMessageChannelId,
+      channelId: message.channelId,
       sourceMessageId: message.id,
       ...safeErrorDetails(error),
     });
@@ -2125,7 +2130,7 @@ async function handleFormattedTextMessage(message: Message) {
   try {
     await message.delete();
     writeLog("info", "formatted_message_created", {
-      channelId: formattedMessageChannelId,
+      channelId: message.channelId,
       sourceMessageId: message.id,
       replacementMessageId: replacementMessage.id,
     });
@@ -2137,14 +2142,14 @@ async function handleFormattedTextMessage(message: Message) {
     if (originalStillExists) {
       await replacementMessage.delete().catch((cleanupError: unknown) => {
         writeLog("warn", "formatted_message_cleanup_failed", {
-          channelId: formattedMessageChannelId,
+          channelId: message.channelId,
           replacementMessageId: replacementMessage.id,
           ...safeErrorDetails(cleanupError),
         });
       });
     }
     writeLog("error", "formatted_message_delete_failed", {
-      channelId: formattedMessageChannelId,
+      channelId: message.channelId,
       sourceMessageId: message.id,
       replacementMessageId: replacementMessage.id,
       ...safeErrorDetails(error),
@@ -2301,25 +2306,35 @@ async function leaveUnauthorizedGuilds() {
   }
 }
 
-async function validateFormattedMessageChannel() {
-  const channel = await client.channels.fetch(formattedMessageChannelId);
-  if (!channel || channel.type !== ChannelType.GuildText) {
-    writeLog("error", "formatted_message_channel_unavailable", {
-      channelId: formattedMessageChannelId,
-    });
-    return;
-  }
+async function validateFormattedMessageChannels() {
+  for (const formattedChannelId of formattedMessageChannelIds) {
+    try {
+      const channel = await client.channels.fetch(formattedChannelId);
+      if (!channel || channel.type !== ChannelType.GuildText) {
+        writeLog("error", "formatted_message_channel_unavailable", {
+          channelId: formattedChannelId,
+        });
+        continue;
+      }
 
-  const missingPermissions = getFormattedMessageChannelMissingPermissions(channel);
-  if (missingPermissions.length > 0) {
-    writeLog("warn", "formatted_message_channel_permissions_missing", {
-      channelId: formattedMessageChannelId,
-      permissions: missingPermissions.join(", "),
-    });
-  } else {
-    writeLog("info", "formatted_message_channel_ready", {
-      channelId: formattedMessageChannelId,
-    });
+      const missingPermissions =
+        getFormattedMessageChannelMissingPermissions(channel);
+      if (missingPermissions.length > 0) {
+        writeLog("warn", "formatted_message_channel_permissions_missing", {
+          channelId: formattedChannelId,
+          permissions: missingPermissions.join(", "),
+        });
+      } else {
+        writeLog("info", "formatted_message_channel_ready", {
+          channelId: formattedChannelId,
+        });
+      }
+    } catch (error: unknown) {
+      writeLog("error", "formatted_message_channel_validation_failed", {
+        channelId: formattedChannelId,
+        ...safeErrorDetails(error),
+      });
+    }
   }
 }
 
@@ -2585,12 +2600,7 @@ client.once(Events.ClientReady, (readyClient) => {
     .catch((error: unknown) => {
       writeLog("error", "channel_validation_failed", safeErrorDetails(error));
     });
-  void validateFormattedMessageChannel().catch((error: unknown) => {
-    writeLog("error", "formatted_message_channel_validation_failed", {
-      channelId: formattedMessageChannelId,
-      ...safeErrorDetails(error),
-    });
-  });
+  void validateFormattedMessageChannels();
   void ensureWhisperPanel().catch((error: unknown) => {
     writeLog("error", "whisper_panel_setup_failed", {
       channelId: whisperChannelId,
