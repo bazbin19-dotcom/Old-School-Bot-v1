@@ -1044,7 +1044,8 @@ async function handleWhisperButton(
   action: string | undefined,
   value: string | undefined,
 ) {
-  if (interaction.channelId !== whisperChannelId) {
+  const channelId = interaction.channelId;
+  if (!isWhisperChannelId(channelId)) {
     await replyPrivately(interaction, "هذا الزر غير متاح هنا.");
     return;
   }
@@ -1054,7 +1055,7 @@ async function handleWhisperButton(
       `SELECT message_id
        FROM discord_whisper_panels
        WHERE channel_id = $1`,
-      [whisperChannelId],
+      [channelId],
     );
     if (panel.rows[0]?.message_id !== interaction.message.id) {
       await replyPrivately(interaction, "لوحة الهمسات لم تعد متاحة.");
@@ -1093,7 +1094,7 @@ async function handleWhisperButton(
     const whisper = await getWhisper(value);
     if (
       !whisper ||
-      whisper.channel_id !== whisperChannelId ||
+      whisper.channel_id !== channelId ||
       whisper.message_id !== interaction.message.id
     ) {
       await interaction.editReply("هذه الهمسة لم تعد متاحة.");
@@ -1121,7 +1122,7 @@ async function handleWhisperButton(
                  body, anonymous, created_at, opened_at`,
       [
         whisper.whisper_id,
-        whisperChannelId,
+        channelId,
         interaction.message.id,
         interaction.user.id,
       ],
@@ -1147,7 +1148,7 @@ async function handleWhisperButton(
       });
     } catch (error) {
       writeLog("warn", "whisper_card_countdown_update_failed", {
-        channelId: whisperChannelId,
+        channelId,
         ...safeErrorDetails(error),
       });
     }
@@ -1165,11 +1166,12 @@ async function handleWhisperRecipientSelect(
 ) {
   const [prefix, action, mode] = interaction.customId.split(":");
   const recipientId = interaction.values[0];
+  const channelId = interaction.channelId;
   if (
     prefix !== "whisper" ||
     action !== "recipient" ||
     !isWhisperMode(mode) ||
-    interaction.channelId !== whisperChannelId ||
+    !isWhisperChannelId(channelId) ||
     !interaction.guildId ||
     !recipientId
   ) {
@@ -1189,10 +1191,11 @@ async function handleWhisperSubmit(
   recipientId: string | undefined,
 ) {
   await interaction.deferReply({ ephemeral: true });
+  const channelId = interaction.channelId;
   if (
     !isWhisperMode(mode) ||
     !recipientId ||
-    interaction.channelId !== whisperChannelId ||
+    !isWhisperChannelId(channelId) ||
     !interaction.guildId
   ) {
     await interaction.editReply("تعذر إرسال الهمسة. ابدأ من لوحة الهمسات وحاول مرة أخرى.");
@@ -1205,7 +1208,7 @@ async function handleWhisperSubmit(
     return;
   }
 
-  const channel = await client.channels.fetch(whisperChannelId);
+  const channel = await client.channels.fetch(channelId);
   if (
     !channel ||
     channel.type !== ChannelType.GuildText ||
@@ -1245,7 +1248,7 @@ async function handleWhisperSubmit(
        RETURNING created_at`,
       [
         whisperId,
-        whisperChannelId,
+        channelId,
         recipientId,
         senderName,
         body,
@@ -1274,7 +1277,7 @@ async function handleWhisperSubmit(
     if (cardMessage) {
       await cardMessage.delete().catch((cleanupError: unknown) => {
         writeLog("warn", "whisper_card_cleanup_failed", {
-          channelId: whisperChannelId,
+          channelId,
           ...safeErrorDetails(cleanupError),
         });
       });
@@ -1283,7 +1286,7 @@ async function handleWhisperSubmit(
       .query(`DELETE FROM discord_whisper_messages WHERE whisper_id = $1`, [whisperId])
       .catch(() => undefined);
     writeLog("error", "whisper_send_failed", {
-      channelId: whisperChannelId,
+      channelId,
       ...safeErrorDetails(error),
     });
     await interaction.editReply("تعذر إرسال الهمسة. لم يُنشر محتواها في القناة.");
@@ -1295,7 +1298,7 @@ async function handleWhisperSubmit(
     panelMoved = await queueWhisperPanelMove(channel);
   } catch (error) {
     writeLog("warn", "whisper_panel_move_failed", {
-      channelId: whisperChannelId,
+      channelId,
       ...safeErrorDetails(error),
     });
   }
@@ -2363,76 +2366,86 @@ function getWhisperChannelMissingPermissions(channel: TextChannel) {
     : requiredPermissions.map(([, name]) => name);
 }
 
-async function ensureWhisperPanel() {
-  const channel = await client.channels.fetch(whisperChannelId);
-  if (!channel || channel.type !== ChannelType.GuildText) {
-    writeLog("error", "whisper_channel_unavailable", {
-      channelId: whisperChannelId,
-    });
-    return;
-  }
-
-  const missingPermissions = getWhisperChannelMissingPermissions(channel);
-  if (missingPermissions.length > 0) {
-    writeLog("warn", "whisper_channel_permissions_missing", {
-      channelId: whisperChannelId,
-      permissions: missingPermissions.join(", "),
-    });
-    return;
-  }
-
-  const storedPanel = await pool.query<{ message_id: string }>(
-    `SELECT message_id
-     FROM discord_whisper_panels
-     WHERE channel_id = $1`,
-    [whisperChannelId],
-  );
-  const previousMessageId = storedPanel.rows[0]?.message_id;
-  const previousPanel = previousMessageId
-    ? await channel.messages.fetch(previousMessageId).catch(() => null)
-    : null;
-
-  const panelPayload = buildWhisperPanelPayload();
-
-  if (previousPanel) {
-    await previousPanel.edit(panelPayload);
-    writeLog("info", "whisper_panel_ready", {
-      channelId: whisperChannelId,
-      messageId: previousPanel.id,
-      reused: true,
-    });
-    return;
-  }
-
-  const newPanel = await channel.send(panelPayload);
+async function ensureWhisperPanel(channelId: string) {
   try {
-    await pool.query(
-      `INSERT INTO discord_whisper_panels (channel_id, message_id)
-       VALUES ($1, $2)
-       ON CONFLICT (channel_id)
-       DO UPDATE SET message_id = EXCLUDED.message_id`,
-      [whisperChannelId, newPanel.id],
-    );
-  } catch (error) {
-    await newPanel.delete().catch(() => undefined);
-    throw error;
-  }
+    const channel = await client.channels.fetch(channelId);
+    if (!channel || channel.type !== ChannelType.GuildText) {
+      writeLog("error", "whisper_channel_unavailable", { channelId });
+      return;
+    }
 
-  writeLog("info", "whisper_panel_ready", {
-    channelId: whisperChannelId,
-    messageId: newPanel.id,
-    reused: false,
-  });
+    const missingPermissions = getWhisperChannelMissingPermissions(channel);
+    if (missingPermissions.length > 0) {
+      writeLog("warn", "whisper_channel_permissions_missing", {
+        channelId,
+        permissions: missingPermissions.join(", "),
+      });
+      return;
+    }
+
+    const storedPanel = await pool.query<{ message_id: string }>(
+      `SELECT message_id
+       FROM discord_whisper_panels
+       WHERE channel_id = $1`,
+      [channelId],
+    );
+    const previousMessageId = storedPanel.rows[0]?.message_id;
+    const previousPanel = previousMessageId
+      ? await channel.messages.fetch(previousMessageId).catch(() => null)
+      : null;
+
+    const panelPayload = buildWhisperPanelPayload();
+
+    if (previousPanel) {
+      await previousPanel.edit(panelPayload);
+      writeLog("info", "whisper_panel_ready", {
+        channelId,
+        messageId: previousPanel.id,
+        reused: true,
+      });
+      return;
+    }
+
+    const newPanel = await channel.send(panelPayload);
+    try {
+      await pool.query(
+        `INSERT INTO discord_whisper_panels (channel_id, message_id)
+         VALUES ($1, $2)
+         ON CONFLICT (channel_id)
+         DO UPDATE SET message_id = EXCLUDED.message_id`,
+        [channelId, newPanel.id],
+      );
+    } catch (error) {
+      await newPanel.delete().catch(() => undefined);
+      throw error;
+    }
+
+    writeLog("info", "whisper_panel_ready", {
+      channelId,
+      messageId: newPanel.id,
+      reused: false,
+    });
+  } catch (error: unknown) {
+    writeLog("error", "whisper_panel_setup_failed", {
+      channelId,
+      ...safeErrorDetails(error),
+    });
+  }
+}
+
+async function ensureWhisperPanels() {
+  await Promise.all(whisperChannelIds.map((channelId) => ensureWhisperPanel(channelId)));
 }
 
 let whisperPanelMoveQueue: Promise<void> = Promise.resolve();
 
 async function moveWhisperPanelToBottom(channel: TextChannel): Promise<boolean> {
+  const channelId = channel.id;
   const storedPanel = await pool.query<{ message_id: string }>(
     `SELECT message_id
      FROM discord_whisper_panels
      WHERE channel_id = $1`,
-    [whisperChannelId],
+    [channelId],
   );
   const previousMessageId = storedPanel.rows[0]?.message_id;
   const previousPanel = previousMessageId
@@ -2446,12 +2459,12 @@ async function moveWhisperPanelToBottom(channel: TextChannel): Promise<boolean> 
        VALUES ($1, $2)
        ON CONFLICT (channel_id)
        DO UPDATE SET message_id = EXCLUDED.message_id`,
-      [whisperChannelId, newPanel.id],
+      [channelId, newPanel.id],
     );
   } catch (error) {
     await newPanel.delete().catch((cleanupError: unknown) => {
       writeLog("warn", "whisper_panel_replacement_cleanup_failed", {
-        channelId: whisperChannelId,
+        channelId,
         ...safeErrorDetails(cleanupError),
       });
     });
@@ -2468,12 +2481,12 @@ async function moveWhisperPanelToBottom(channel: TextChannel): Promise<boolean> 
           `UPDATE discord_whisper_panels
            SET message_id = $2
            WHERE channel_id = $1`,
-          [whisperChannelId, previousPanel.id],
+          [channelId, previousPanel.id],
         );
         restoredPreviousPanel = true;
       } catch (restoreError) {
         writeLog("error", "whisper_panel_reference_restore_failed", {
-          channelId: whisperChannelId,
+          channelId,
           ...safeErrorDetails(restoreError),
         });
       }
@@ -2481,14 +2494,14 @@ async function moveWhisperPanelToBottom(channel: TextChannel): Promise<boolean> 
       if (restoredPreviousPanel) {
         await newPanel.delete().catch((cleanupError: unknown) => {
           writeLog("warn", "whisper_panel_replacement_cleanup_failed", {
-            channelId: whisperChannelId,
+            channelId,
             ...safeErrorDetails(cleanupError),
           });
         });
       }
 
       writeLog("warn", "whisper_panel_old_message_delete_failed", {
-        channelId: whisperChannelId,
+        channelId,
         ...safeErrorDetails(error),
       });
       return false;
@@ -2496,7 +2509,7 @@ async function moveWhisperPanelToBottom(channel: TextChannel): Promise<boolean> 
   }
 
   writeLog("info", "whisper_panel_moved_to_bottom", {
-    channelId: whisperChannelId,
+    channelId,
     messageId: newPanel.id,
     replacedMessageId: previousMessageId ?? "none",
   });
@@ -2610,12 +2623,7 @@ client.once(Events.ClientReady, (readyClient) => {
       writeLog("error", "channel_validation_failed", safeErrorDetails(error));
     });
   void validateFormattedMessageChannels();
-  void ensureWhisperPanel().catch((error: unknown) => {
-    writeLog("error", "whisper_panel_setup_failed", {
-      channelId: whisperChannelId,
-      ...safeErrorDetails(error),
-    });
-  });
+  void ensureWhisperPanels();
   startWhisperExpirationCleanup();
   void retryConfiguredSourceMessage().catch((error: unknown) => {
     writeLog("error", "retry_source_failed", {
