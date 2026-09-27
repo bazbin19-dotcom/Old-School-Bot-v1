@@ -327,6 +327,46 @@ async function memberHasStarterRole(guild: Guild | null, userId: string) {
   return Boolean(member?.roles.cache.has(auctionStarterRoleId));
 }
 
+async function sendAuctionSetupLauncher(
+  pool: PgPool,
+  channel: TextChannel,
+  auctionId: string,
+  creatorId: string,
+) {
+  let launcherMessage: Message | null = null;
+  try {
+    launcherMessage = await channel.send({
+      content: "اضغط «إعداد المزاد» خلال دقيقة لفتح لوحة الإعداد التي لا يراها سواك.",
+      components: [makeAuctionOpenButton(auctionId)],
+      allowedMentions: { parse: [] },
+    });
+    const stored = await pool.query<{ id: string }>(
+      `UPDATE discord_auctions
+       SET setup_message_id = $2,
+           setup_launcher_expires_at = now() + interval '1 minute',
+           setup_launcher_deleted = false,
+           setup_launcher_disabled = false,
+           updated_at = now()
+       WHERE id = $1 AND status = 'setup' AND creator_id = $3
+       RETURNING id`,
+      [auctionId, launcherMessage.id, creatorId],
+    );
+    if (!stored.rows[0]) {
+      await launcherMessage.delete().catch(() => undefined);
+      return false;
+    }
+    logAuctionInfo("auction_setup_launcher_created", {
+      auctionId,
+      creatorId,
+      messageId: launcherMessage.id,
+    });
+    return true;
+  } catch (error) {
+    await launcherMessage?.delete().catch(() => undefined);
+    throw error;
+  }
+}
+
 async function createAuctionSetup(
   client: Client,
   pool: PgPool,
@@ -341,16 +381,50 @@ async function createAuctionSetup(
          AND created_at < now() - ($2::double precision * interval '1 millisecond')`,
       [auctionChannelId, auctionSetupExpiryMs],
     );
-    const existing = await pool.query<{ id: string }>(
-      `SELECT id
+    const existing = await pool.query<{
+      id: string;
+      status: AuctionStatus;
+      creator_id: string;
+      setup_message_id: string | null;
+      setup_launcher_expires_at: Date | null;
+      setup_launcher_deleted: boolean;
+    }>(
+      `SELECT id, status, creator_id, setup_message_id,
+              setup_launcher_expires_at, setup_launcher_deleted
        FROM discord_auctions
        WHERE channel_id = $1 AND status IN ('setup', 'active')
        LIMIT 1`,
       [auctionChannelId],
     );
-    if (existing.rows[0]) {
+    const current = existing.rows[0];
+    if (current) {
+      const launcherExpired =
+        current.setup_launcher_deleted ||
+        !current.setup_message_id ||
+        !current.setup_launcher_expires_at ||
+        current.setup_launcher_expires_at.getTime() <= Date.now();
+      if (
+        current.status === "setup" &&
+        current.creator_id === message.author.id &&
+        launcherExpired
+      ) {
+        const channel = await getAuctionTextChannel(client);
+        if (current.setup_message_id) {
+          const previousLauncher = await channel.messages
+            .fetch(current.setup_message_id)
+            .catch(() => null);
+          await previousLauncher?.delete().catch(() => undefined);
+        }
+        await sendAuctionSetupLauncher(
+          pool,
+          channel,
+          current.id,
+          message.author.id,
+        );
+        return;
+      }
       logAuctionInfo("auction_setup_already_open", {
-        auctionId: existing.rows[0].id,
+        auctionId: current.id,
         userId: message.author.id,
       });
       return;
@@ -358,7 +432,6 @@ async function createAuctionSetup(
 
     const channel = await getAuctionTextChannel(client);
     const auctionId = randomUUID();
-    let launcherMessage: Message | null = null;
     try {
       await pool.query(
         `INSERT INTO discord_auctions
@@ -372,27 +445,15 @@ async function createAuctionSetup(
           message.author.id,
         ],
       );
-      launcherMessage = await channel.send({
-        content:
-          "اضغط «إعداد المزاد» لفتح لوحة الإعداد التي لا يراها سواك.",
-        components: [makeAuctionOpenButton(auctionId)],
-        allowedMentions: { parse: [] },
-      });
-      await pool.query(
-        `UPDATE discord_auctions
-         SET setup_message_id = $2, updated_at = now()
-         WHERE id = $1`,
-        [auctionId, launcherMessage.id],
-      );
-      logAuctionInfo("auction_setup_launcher_created", {
+      await sendAuctionSetupLauncher(
+        pool,
+        channel,
         auctionId,
-        creatorId: message.author.id,
-        messageId: launcherMessage.id,
-      });
+        message.author.id,
+      );
     } catch (error) {
       await pool.query("DELETE FROM discord_auctions WHERE id = $1", [auctionId])
         .catch(() => undefined);
-      await launcherMessage?.delete().catch(() => undefined);
       if (isUniqueViolation(error)) {
         logAuctionInfo("auction_setup_race_lost", {
           auctionId,
@@ -498,7 +559,9 @@ async function handleAuctionOpenButton(
     auction.guild_id !== auctionGuildId ||
     interaction.guildId !== auctionGuildId ||
     interaction.channelId !== auction.setup_channel_id ||
-    interaction.message.id !== auction.setup_message_id
+    interaction.message.id !== auction.setup_message_id ||
+    !auction.setup_launcher_expires_at ||
+    auction.setup_launcher_expires_at.getTime() <= Date.now()
   ) {
     await replyPrivately(interaction, "هذا الإعداد غير متاح لك أو لم يعد مفتوحاً.");
     return;
@@ -1234,49 +1297,46 @@ async function sendPendingAuctionResults(
   }
 }
 
-async function disableCompletedSetupLaunchers(
+async function deleteExpiredSetupLaunchers(
   pool: PgPool,
   channel: TextChannel,
 ) {
-  const pending = await pool.query<AuctionRow>(
-    `SELECT ${auctionRowSelect()}
+  const pending = await pool.query<{
+    id: string;
+    setup_message_id: string;
+  }>(
+    `SELECT id, setup_message_id
      FROM discord_auctions
-     WHERE status <> 'setup'
-       AND setup_message_id IS NOT NULL
-       AND NOT setup_launcher_disabled
-     ORDER BY created_at`,
+     WHERE setup_message_id IS NOT NULL
+       AND setup_launcher_expires_at <= now()
+       AND NOT setup_launcher_deleted
+     ORDER BY setup_launcher_expires_at
+     LIMIT 100`,
   );
   for (const auction of pending.rows) {
     try {
-      const launcher = await channel.messages.fetch(auction.setup_message_id!);
-      await launcher.edit({
-        content: "اكتمل إعداد هذا المزاد أو انتهى.",
-        components: [makeAuctionOpenButton(auction.id, true)],
-        allowedMentions: { parse: [] },
-      });
-      await pool.query(
-        `UPDATE discord_auctions
-         SET setup_launcher_disabled = true, updated_at = now()
-         WHERE id = $1`,
-        [auction.id],
-      );
+      const launcher = await channel.messages.fetch(auction.setup_message_id);
+      await launcher.delete();
     } catch (error) {
-      if (isUnknownDiscordMessage(error)) {
-        await pool.query(
-          `UPDATE discord_auctions
-           SET setup_launcher_disabled = true, updated_at = now()
-           WHERE id = $1`,
-          [auction.id],
-        );
-        logAuctionInfo("auction_setup_launcher_missing", {
+      if (!isUnknownDiscordMessage(error)) {
+        logAuctionError("auction_setup_launcher_delete_failed", error, {
           auctionId: auction.id,
         });
         continue;
       }
-      logAuctionError("auction_setup_launcher_disable_failed", error, {
+      logAuctionInfo("auction_setup_launcher_already_missing", {
         auctionId: auction.id,
       });
     }
+    await pool.query(
+      `UPDATE discord_auctions
+       SET setup_message_id = NULL,
+           setup_launcher_deleted = true,
+           setup_launcher_disabled = true,
+           updated_at = now()
+       WHERE id = $1 AND setup_message_id = $2`,
+      [auction.id, auction.setup_message_id],
+    );
   }
 }
 
@@ -1290,7 +1350,7 @@ async function runAuctionMaintenance(client: Client, pool: PgPool) {
     await updateExistingAuctionButtons(pool, channel);
     await sendPendingBidAnnouncements(pool, channel);
     await sendPendingAuctionResults(pool, channel);
-    await disableCompletedSetupLaunchers(pool, channel);
+    await deleteExpiredSetupLaunchers(pool, channel);
   } catch (error) {
     logAuctionError("auction_maintenance_failed", error);
   } finally {
