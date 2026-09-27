@@ -26,45 +26,25 @@ export type AuctionPanelValues = {
 
 export function makeAuctionSetupPanel(
   auctionId: string,
-  auction: AuctionPanelValues,
+  sessionId: string,
 ) {
-  const isEditable = auction.status === "setup";
-  const statusMessage =
-    auction.status === "setup"
-      ? "لن يبدأ العدّ التنازلي حتى تكتمل الحقول الثلاثة. عند اكتمالها يبدأ المزاد تلقائياً."
-      : auction.status === "active"
-        ? `بدأ المزاد. المزايدة الحالية: **${formatAuctionAmount(auction.current_bid)}**`
-        : auction.status === "completed"
-          ? "انتهى هذا المزاد."
-          : "انتهت صلاحية إعداد هذا المزاد.";
-  const itemName = auction.item_name
-    ? escapeMarkdown(auction.item_name)
-    : "لم يُحدد بعد";
-  const fields = [
-    `**المدة:** ${formatAuctionDuration(auction.duration_ms)}`,
-    `**سعر البدء:** ${formatAuctionAmount(auction.starting_price)}`,
-    `**العنصر:** ${itemName}`,
-  ].join("\n");
-
   const buttons = new ActionRowBuilder<ButtonBuilder>().addComponents(
     new ButtonBuilder()
-      .setCustomId(`auction:field:duration:${auctionId}`)
+      .setCustomId(`auction:field:duration:${auctionId}:${sessionId}`)
       .setLabel("المدة")
       .setEmoji("⏱️")
       .setStyle(ButtonStyle.Secondary)
-      .setDisabled(!isEditable),
+      ,
     new ButtonBuilder()
-      .setCustomId(`auction:field:price:${auctionId}`)
+      .setCustomId(`auction:field:price:${auctionId}:${sessionId}`)
       .setLabel("سعر البدء")
       .setEmoji("💰")
-      .setStyle(ButtonStyle.Secondary)
-      .setDisabled(!isEditable),
+      .setStyle(ButtonStyle.Secondary),
     new ButtonBuilder()
-      .setCustomId(`auction:field:item:${auctionId}`)
+      .setCustomId(`auction:field:item:${auctionId}:${sessionId}`)
       .setLabel("العنصر")
       .setEmoji("📦")
-      .setStyle(ButtonStyle.Secondary)
-      .setDisabled(!isEditable),
+      .setStyle(ButtonStyle.Secondary),
   );
 
   return new ContainerBuilder()
@@ -73,9 +53,8 @@ export function makeAuctionSetupPanel(
       new TextDisplayBuilder().setContent(
         [
           "## 🔨 إعداد المزاد",
-          "استخدم الأزرار أدناه لتحديد مدة المزاد وسعر البدء والعنصر.",
-          "هذه المحادثة في خيط خاص؛ قد يراه مشرفو السيرفر.",
-          statusMessage,
+          "هذه اللوحة مرئية لك وحدك.",
+          "أدخل المدة وسعر البدء والعنصر عبر الأزرار أدناه. يبدأ المزاد تلقائياً بعد حفظ الحقول الثلاثة.",
         ].join("\n"),
       ),
     )
@@ -85,9 +64,33 @@ export function makeAuctionSetupPanel(
         .setSpacing(SeparatorSpacingSize.Large),
     )
     .addTextDisplayComponents(
-      new TextDisplayBuilder().setContent(`### تفاصيل المزاد\n${fields}`),
+      new TextDisplayBuilder().setContent(
+        "### إعداد المزاد\nيمكنك حفظ الحقول بأي ترتيب. ستظهر رسالة عامة عند بدء المزاد.",
+      ),
     )
     .addActionRowComponents(buttons);
+}
+
+export function makeAuctionOpenButton(auctionId: string, disabled = false) {
+  return new ActionRowBuilder<ButtonBuilder>().addComponents(
+    new ButtonBuilder()
+      .setCustomId(`auction:open:${auctionId}`)
+      .setLabel("إعداد المزاد")
+      .setEmoji("🔨")
+      .setStyle(ButtonStyle.Primary)
+      .setDisabled(disabled),
+  );
+}
+
+export function makeAuctionBidButton(auctionId: string, disabled = false) {
+  return new ActionRowBuilder<ButtonBuilder>().addComponents(
+    new ButtonBuilder()
+      .setCustomId(`auction:bid:${auctionId}`)
+      .setLabel("قدّم مزايدة")
+      .setEmoji("💸")
+      .setStyle(ButtonStyle.Success)
+      .setDisabled(disabled),
+  );
 }
 
 export function makeAuctionStartedEmbed(auction: {
@@ -112,7 +115,7 @@ export function makeAuctionStartedEmbed(auction: {
         inline: true,
       },
     )
-    .setFooter({ text: "للمزايدة، أرسل رقماً أعلى من سعر البدء في هذه القناة." });
+    .setFooter({ text: "اضغط «قدّم مزايدة» وأدخل مبلغك؛ ستظهر المزايدات المقبولة في القناة." });
 }
 
 export function makeAuctionResultEmbed(auction: {
@@ -154,11 +157,4 @@ export function makeAuctionResultEmbed(auction: {
 
   if (auction.completed_at) embed.setTimestamp(auction.completed_at);
   return embed;
-}
-
-export function makeAuctionNoticeEmbed(title: string, description: string) {
-  return new EmbedBuilder()
-    .setColor(0xed4245)
-    .setTitle(title)
-    .setDescription(description);
 }
