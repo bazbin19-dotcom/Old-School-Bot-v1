@@ -18,7 +18,6 @@ import {
 } from "discord.js";
 import { Pool as PgPool, type QueryResultRow } from "pg";
 import {
-  makeAuctionBidButton,
   makeAuctionOpenButton,
   makeAuctionResultEmbed,
   makeAuctionSetupPanel,
@@ -59,6 +58,7 @@ type AuctionRow = QueryResultRow &
     result_message_id: string | null;
     bid_button_configured: boolean;
     bid_button_disabled: boolean;
+    bid_button_removed: boolean;
     setup_launcher_disabled: boolean;
     created_at: Date;
   };
@@ -118,7 +118,8 @@ function auctionRowSelect() {
           duration_ms, starting_price, item_name, current_bid,
           highest_bidder_id, started_at, ends_at, completed_at,
           start_message_id, result_message_id, bid_button_configured,
-          bid_button_disabled, setup_launcher_disabled, created_at`;
+          bid_button_disabled, bid_button_removed,
+          setup_launcher_disabled, created_at`;
 }
 
 export async function initializeAuctionTables(pool: PgPool) {
@@ -148,6 +149,7 @@ export async function initializeAuctionTables(pool: PgPool) {
       result_message_id text,
       bid_button_configured boolean NOT NULL DEFAULT false,
       bid_button_disabled boolean NOT NULL DEFAULT false,
+      bid_button_removed boolean NOT NULL DEFAULT false,
       setup_launcher_disabled boolean NOT NULL DEFAULT false,
       created_at timestamptz NOT NULL DEFAULT now(),
       updated_at timestamptz NOT NULL DEFAULT now()
@@ -190,6 +192,7 @@ export async function initializeAuctionTables(pool: PgPool) {
       ADD COLUMN IF NOT EXISTS setup_launcher_deleted boolean NOT NULL DEFAULT false,
       ADD COLUMN IF NOT EXISTS bid_button_configured boolean NOT NULL DEFAULT false,
       ADD COLUMN IF NOT EXISTS bid_button_disabled boolean NOT NULL DEFAULT false,
+      ADD COLUMN IF NOT EXISTS bid_button_removed boolean NOT NULL DEFAULT false,
       ADD COLUMN IF NOT EXISTS setup_launcher_disabled boolean NOT NULL DEFAULT false
   `);
   await pool.query(`
@@ -276,6 +279,7 @@ async function validateAuctionChannel(client: Client) {
     [PermissionFlagsBits.ReadMessageHistory, "Read Message History"],
     [PermissionFlagsBits.SendMessages, "Send Messages"],
     [PermissionFlagsBits.EmbedLinks, "Embed Links"],
+    [PermissionFlagsBits.ManageMessages, "Manage Messages"],
   ];
   const missingPermissions = requiredPermissions
     .filter(([permission]) => !permissions?.has(permission))
@@ -532,20 +536,6 @@ function makeAuctionSetupFieldModal(
     .addComponents(new ActionRowBuilder<TextInputBuilder>().addComponents(input));
 }
 
-function makeAuctionBidModal(auctionId: string) {
-  const input = new TextInputBuilder()
-    .setCustomId("bid_amount")
-    .setLabel("مبلغ المزايدة")
-    .setPlaceholder("اكتب رقماً أعلى من السعر الحالي")
-    .setStyle(TextInputStyle.Short)
-    .setRequired(true)
-    .setMaxLength(40);
-  return new ModalBuilder()
-    .setCustomId(`auction:bid_submit:${auctionId}`)
-    .setTitle("تقديم مزايدة")
-    .addComponents(new ActionRowBuilder<TextInputBuilder>().addComponents(input));
-}
-
 async function handleAuctionOpenButton(
   pool: PgPool,
   interaction: ButtonInteraction,
@@ -627,26 +617,6 @@ async function handleAuctionSetupFieldButton(
   );
 }
 
-async function handleAuctionBidButton(
-  pool: PgPool,
-  interaction: ButtonInteraction,
-  auctionId: string | undefined,
-) {
-  if (!auctionId) return;
-  const auction = await getAuction(pool, auctionId);
-  if (
-    !auction ||
-    auction.guild_id !== auctionGuildId ||
-    auction.channel_id !== interaction.channelId ||
-    auction.start_message_id !== interaction.message.id ||
-    auction.status !== "active"
-  ) {
-    await replyPrivately(interaction, "انتهى هذا المزاد أو لم يعد متاحاً للمزايدة.");
-    return;
-  }
-  await interaction.showModal(makeAuctionBidModal(auctionId));
-}
-
 async function handleAuctionButton(
   pool: PgPool,
   interaction: ButtonInteraction,
@@ -660,7 +630,10 @@ async function handleAuctionButton(
     return;
   }
   if (action === "bid" && fieldOrAuctionId) {
-    await handleAuctionBidButton(pool, interaction, fieldOrAuctionId);
+    await replyPrivately(
+      interaction,
+      "أرسل مبلغ المزايدة كرقم مباشر في قناة المزاد.",
+    );
     return;
   }
   if (action === "field") {
@@ -952,58 +925,6 @@ async function recordAuctionBid(
   }
 }
 
-async function handleAuctionBidModal(
-  client: Client,
-  pool: PgPool,
-  interaction: ModalSubmitInteraction,
-  auctionId: string | undefined,
-) {
-  if (!auctionId || interaction.channelId !== auctionChannelId) return;
-  const amount = parseAuctionAmount(
-    interaction.fields.getTextInputValue("bid_amount").trim(),
-  );
-  if (amount === null) {
-    await replyPrivately(interaction, "اكتب مبلغاً موجباً بالأرقام، مثل: 1000.");
-    return;
-  }
-
-  const decision = await recordAuctionBid(
-    pool,
-    auctionId,
-    interaction.user.id,
-    amount,
-  );
-  if (decision.kind === "below_start") {
-    await replyPrivately(
-      interaction,
-      `المبلغ أقل من سعر البدء. أدخل مبلغاً أعلى من ${formatAuctionAmount(decision.startingPrice)}.`,
-    );
-    return;
-  }
-  if (decision.kind === "below_current") {
-    await replyPrivately(
-      interaction,
-      `المبلغ أقل من آخر مزايدة. أدخل مبلغاً أعلى من ${formatAuctionAmount(decision.currentBid)}.`,
-    );
-    return;
-  }
-  if (decision.kind === "ended") {
-    await replyPrivately(interaction, "انتهى المزاد؛ لا يمكن قبول مزايدات جديدة.");
-    void runAuctionMaintenance(client, pool);
-    return;
-  }
-  if (decision.kind === "unavailable") {
-    await replyPrivately(interaction, "هذا المزاد لم يعد متاحاً للمزايدة.");
-    return;
-  }
-
-  await replyPrivately(
-    interaction,
-    "تم قبول مزايدتك. سينشر البوت الرقم علناً في القناة.",
-  );
-  void runAuctionMaintenance(client, pool);
-}
-
 async function handleAuctionModal(
   client: Client,
   pool: PgPool,
@@ -1013,7 +934,10 @@ async function handleAuctionModal(
     interaction.customId.split(":");
   if (prefix !== "auction") return;
   if (action === "bid_submit") {
-    await handleAuctionBidModal(client, pool, interaction, fieldOrAuctionId);
+    await replyPrivately(
+      interaction,
+      "أرسل مبلغ المزايدة كرقم مباشر في قناة المزاد.",
+    );
     return;
   }
   if (action === "setup") {
@@ -1028,6 +952,27 @@ async function handleAuctionModal(
   }
 }
 
+function isAuctionNumericMessage(value: string) {
+  return /^[+-]?[0-9٠-٩۰-۹][0-9٠-٩۰-۹ \t,٬٫._]*$/.test(value.trim());
+}
+
+async function deleteRejectedAuctionMessage(message: Message, reason: string) {
+  try {
+    await message.delete();
+    logAuctionInfo("auction_bid_message_deleted", {
+      messageId: message.id,
+      userId: message.author.id,
+      reason,
+    });
+  } catch (error) {
+    logAuctionError("auction_bid_rejected_message_delete_failed", error, {
+      messageId: message.id,
+      userId: message.author.id,
+      reason,
+    });
+  }
+}
+
 async function handleAuctionMessage(
   client: Client,
   pool: PgPool,
@@ -1039,17 +984,53 @@ async function handleAuctionMessage(
     message.webhookId ||
     message.guildId !== auctionGuildId ||
     message.channelId !== auctionChannelId ||
-    message.content.trim() !== "مزاد" ||
     !auctionChannelReady
   ) {
     return;
   }
 
-  const member =
-    message.member ??
-    (await message.guild.members.fetch(message.author.id).catch(() => null));
-  if (!member?.roles.cache.has(auctionStarterRoleId)) return;
-  await createAuctionSetup(client, pool, message);
+  const content = message.content.trim();
+  if (content === "مزاد") {
+    const member =
+      message.member ??
+      (await message.guild.members.fetch(message.author.id).catch(() => null));
+    if (!member?.roles.cache.has(auctionStarterRoleId)) return;
+    await createAuctionSetup(client, pool, message);
+    return;
+  }
+
+  if (!content || message.attachments.size > 0) return;
+  const active = await pool.query<{ id: string }>(
+    `SELECT id
+     FROM discord_auctions
+     WHERE guild_id = $1 AND channel_id = $2 AND status = 'active'
+     ORDER BY started_at DESC
+     LIMIT 1`,
+    [auctionGuildId, auctionChannelId],
+  );
+  const auctionId = active.rows[0]?.id;
+  if (!auctionId) return;
+  if (!isAuctionNumericMessage(content)) return;
+
+  const amount = parseAuctionAmount(content);
+  if (amount === null) {
+    await deleteRejectedAuctionMessage(message, "invalid_amount");
+    return;
+  }
+
+  const decision = await recordAuctionBid(
+    pool,
+    auctionId,
+    message.author.id,
+    amount,
+  );
+  if (decision.kind === "accepted") {
+    void runAuctionMaintenance(client, pool);
+    return;
+  }
+
+  await deleteRejectedAuctionMessage(message, decision.kind);
+  if (decision.kind === "ended") void runAuctionMaintenance(client, pool);
 }
 
 async function completeExpiredAuctions(pool: PgPool) {
@@ -1095,7 +1076,6 @@ async function sendPendingStartAnnouncements(
   );
   for (const auction of pending.rows) {
     try {
-      const isActive = auction.status === "active";
       const message = await channel.send({
         embeds: [
           makeAuctionStartedEmbed({
@@ -1104,17 +1084,17 @@ async function sendPendingStartAnnouncements(
             ends_at: auction.ends_at!,
           }),
         ],
-        components: [makeAuctionBidButton(auction.id, !isActive)],
         allowedMentions: { parse: [] },
       });
       await pool.query(
         `UPDATE discord_auctions
          SET start_message_id = $2,
              bid_button_configured = true,
-             bid_button_disabled = $3,
+             bid_button_disabled = true,
+             bid_button_removed = true,
              updated_at = now()
          WHERE id = $1 AND start_message_id IS NULL`,
-        [auction.id, message.id, !isActive],
+        [auction.id, message.id],
       );
     } catch (error) {
       logAuctionError("auction_start_announcement_failed", error, {
@@ -1124,7 +1104,7 @@ async function sendPendingStartAnnouncements(
   }
 }
 
-async function updateExistingAuctionButtons(
+async function removeExistingAuctionBidButtons(
   pool: PgPool,
   channel: TextChannel,
 ) {
@@ -1132,28 +1112,25 @@ async function updateExistingAuctionButtons(
     `SELECT ${auctionRowSelect()}
      FROM discord_auctions
      WHERE start_message_id IS NOT NULL
-       AND (
-         (status = 'active' AND NOT bid_button_configured)
-         OR (status = 'completed' AND NOT bid_button_disabled)
-       )
+       AND NOT bid_button_removed
      ORDER BY started_at NULLS FIRST`,
   );
   for (const auction of pending.rows) {
     try {
       const startMessage = await channel.messages.fetch(auction.start_message_id!);
-      const isActive = auction.status === "active";
       await startMessage.edit({
         embeds: startMessage.embeds,
-        components: [makeAuctionBidButton(auction.id, !isActive)],
+        components: [],
         allowedMentions: { parse: [] },
       });
       await pool.query(
         `UPDATE discord_auctions
          SET bid_button_configured = true,
-             bid_button_disabled = $2,
+             bid_button_disabled = true,
+             bid_button_removed = true,
              updated_at = now()
          WHERE id = $1`,
-        [auction.id, !isActive],
+        [auction.id],
       );
     } catch (error) {
       if (isUnknownDiscordMessage(error)) {
@@ -1167,14 +1144,14 @@ async function updateExistingAuctionButtons(
                   ends_at: auction.ends_at,
                 }),
               ],
-              components: [makeAuctionBidButton(auction.id)],
               allowedMentions: { parse: [] },
             });
             await pool.query(
               `UPDATE discord_auctions
                SET start_message_id = $2,
                    bid_button_configured = true,
-                   bid_button_disabled = false,
+                   bid_button_disabled = true,
+                   bid_button_removed = true,
                    updated_at = now()
                WHERE id = $1`,
               [auction.id, replacement.id],
@@ -1195,6 +1172,7 @@ async function updateExistingAuctionButtons(
             `UPDATE discord_auctions
              SET bid_button_configured = true,
                  bid_button_disabled = true,
+                 bid_button_removed = true,
                  updated_at = now()
              WHERE id = $1`,
             [auction.id],
@@ -1205,7 +1183,7 @@ async function updateExistingAuctionButtons(
         }
         continue;
       }
-      logAuctionError("auction_bid_button_update_failed", error, {
+      logAuctionError("auction_start_button_removal_failed", error, {
         auctionId: auction.id,
       });
     }
@@ -1347,7 +1325,7 @@ async function runAuctionMaintenance(client: Client, pool: PgPool) {
     await completeExpiredAuctions(pool);
     const channel = await getAuctionTextChannel(client);
     await sendPendingStartAnnouncements(client, pool, channel);
-    await updateExistingAuctionButtons(pool, channel);
+    await removeExistingAuctionBidButtons(pool, channel);
     await sendPendingBidAnnouncements(pool, channel);
     await sendPendingAuctionResults(pool, channel);
     await deleteExpiredSetupLaunchers(pool, channel);

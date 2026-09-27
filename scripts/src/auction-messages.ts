@@ -80,17 +80,6 @@ export function makeAuctionOpenButton(auctionId: string, disabled = false) {
   );
 }
 
-export function makeAuctionBidButton(auctionId: string, disabled = false) {
-  return new ActionRowBuilder<ButtonBuilder>().addComponents(
-    new ButtonBuilder()
-      .setCustomId(`auction:bid:${auctionId}`)
-      .setLabel("قدّم مزايدة")
-      .setEmoji("💸")
-      .setStyle(ButtonStyle.Success)
-      .setDisabled(disabled),
-  );
-}
-
 export function makeAuctionStartedEmbed(auction: {
   item_name: string;
   starting_price: string;
@@ -113,7 +102,9 @@ export function makeAuctionStartedEmbed(auction: {
         inline: true,
       },
     )
-    .setFooter({ text: "اضغط «قدّم مزايدة» وأدخل مبلغك؛ ستظهر المزايدات المقبولة في القناة." });
+    .setFooter({
+      text: "للمزايدة، أرسل المبلغ كرقم في القناة. تُقبل المبالغ الأعلى من السعر الحالي.",
+    });
 }
 
 export function makeAuctionResultEmbed(auction: {
