@@ -80,7 +80,7 @@ function logAuctionError(
 ) {
   const info =
     error && typeof error === "object"
-      ? (error as { name?: unknown; code?: unknown })
+      ? (error as { name?: unknown; code?: unknown; message?: unknown })
       : {};
   process.stderr.write(
     `${JSON.stringify({
@@ -90,6 +90,9 @@ function logAuctionError(
       ...details,
       errorName: typeof info.name === "string" ? info.name : "Error",
       ...(info.code !== undefined ? { errorCode: String(info.code) } : {}),
+      ...(typeof info.message === "string"
+        ? { errorMessage: info.message.slice(0, 240) }
+        : {}),
     })}\n`,
   );
 }
@@ -448,7 +451,7 @@ function makeAuctionSetupFieldModal(
         : "تحديد العنصر";
 
   return new ModalBuilder()
-    .setCustomId(`auction:setup_submit:${field}:${auctionId}:${sessionId}`)
+    .setCustomId(`auction:setup:${field}:${auctionId}:${sessionId}`)
     .setTitle(title)
     .addComponents(new ActionRowBuilder<TextInputBuilder>().addComponents(input));
 }
@@ -935,7 +938,7 @@ async function handleAuctionModal(
     await handleAuctionBidModal(client, pool, interaction, fieldOrAuctionId);
     return;
   }
-  if (action === "setup_submit") {
+  if (action === "setup") {
     await handleAuctionSetupModal(
       client,
       pool,
