@@ -50,6 +50,8 @@ type AuctionRow = QueryResultRow &
     setup_message_id: string | null;
     setup_ephemeral_message_id: string | null;
     setup_session_id: string | null;
+    setup_launcher_expires_at: Date | null;
+    setup_launcher_deleted: boolean;
     creator_id: string;
     started_at: Date | null;
     completed_at: Date | null;
@@ -110,7 +112,9 @@ function logAuctionInfo(event: string, details: Record<string, string> = {}) {
 
 function auctionRowSelect() {
   return `id, guild_id, channel_id, setup_channel_id, setup_message_id,
-          setup_ephemeral_message_id, setup_session_id, creator_id, status,
+          setup_ephemeral_message_id, setup_session_id,
+          setup_launcher_expires_at, setup_launcher_deleted,
+          creator_id, status,
           duration_ms, starting_price, item_name, current_bid,
           highest_bidder_id, started_at, ends_at, completed_at,
           start_message_id, result_message_id, bid_button_configured,
@@ -127,6 +131,8 @@ export async function initializeAuctionTables(pool: PgPool) {
       setup_message_id text,
       setup_ephemeral_message_id text,
       setup_session_id text,
+      setup_launcher_expires_at timestamptz,
+      setup_launcher_deleted boolean NOT NULL DEFAULT false,
       creator_id text NOT NULL,
       status text NOT NULL
         CHECK (status IN ('setup', 'active', 'completed', 'cancelled')),
@@ -180,6 +186,8 @@ export async function initializeAuctionTables(pool: PgPool) {
     ALTER TABLE discord_auctions
       ADD COLUMN IF NOT EXISTS setup_ephemeral_message_id text,
       ADD COLUMN IF NOT EXISTS setup_session_id text,
+      ADD COLUMN IF NOT EXISTS setup_launcher_expires_at timestamptz,
+      ADD COLUMN IF NOT EXISTS setup_launcher_deleted boolean NOT NULL DEFAULT false,
       ADD COLUMN IF NOT EXISTS bid_button_configured boolean NOT NULL DEFAULT false,
       ADD COLUMN IF NOT EXISTS bid_button_disabled boolean NOT NULL DEFAULT false,
       ADD COLUMN IF NOT EXISTS setup_launcher_disabled boolean NOT NULL DEFAULT false
@@ -188,6 +196,13 @@ export async function initializeAuctionTables(pool: PgPool) {
     UPDATE discord_auctions
     SET setup_channel_id = channel_id
     WHERE setup_channel_id IS NULL OR setup_channel_id <> channel_id
+  `);
+  await pool.query(`
+    UPDATE discord_auctions
+    SET setup_launcher_expires_at = created_at + interval '1 minute'
+    WHERE setup_message_id IS NOT NULL
+      AND setup_launcher_expires_at IS NULL
+      AND NOT setup_launcher_deleted
   `);
   await pool.query(`
     ALTER TABLE discord_auctions
