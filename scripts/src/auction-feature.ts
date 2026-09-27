@@ -36,6 +36,8 @@ const auctionChannelId = "1553713559501021305";
 const auctionStarterRoleId = "1553725198782701598";
 const auctionMaintenanceIntervalMs = 5_000;
 const auctionSetupExpiryMs = 7 * 24 * 60 * 60 * 1_000;
+// Keep auction handling disabled until the user asks to resume it.
+const auctionFeaturePaused = true;
 
 type AuctionStatus = "setup" | "active" | "completed" | "cancelled";
 type AuctionField = "duration" | "price" | "item";
@@ -1365,6 +1367,14 @@ async function handleAuctionInteraction(
 }
 
 export function attachAuctionFeature(client: Client, pool: PgPool) {
+  if (auctionFeaturePaused) {
+    logAuctionInfo("auction_feature_paused", {
+      guildId: auctionGuildId,
+      channelId: auctionChannelId,
+    });
+    return () => {};
+  }
+
   const onMessage = (message: Message) => {
     void handleAuctionMessage(client, pool, message).catch((error: unknown) => {
       logAuctionError("auction_message_handler_failed", error, {
