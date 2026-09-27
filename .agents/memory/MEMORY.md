@@ -2,3 +2,4 @@
 - [Discord V2 attachments](discord-v2-attachments.md) — preserve existing attachment IDs on message edits or later interactions cannot find the images.
 - [Repositioning Discord messages](discord-message-reposition.md) — Discord cannot move an existing message; replace the bot panel and update its stored ID, leaving one copy.
 - [Forest invite parsing](forest-invite-parsing.md) — tree names may appear in different positions; avoid relying on one fixed invite sentence pattern.
+- [Auction private feedback](auction-private-feedback.md) — auction setup and rejected-bid replies use private channel threads; moderators may still see them.
