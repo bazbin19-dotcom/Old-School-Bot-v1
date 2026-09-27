@@ -53,6 +53,10 @@ import {
   initializeAuctionTables,
 } from "./auction-feature.js";
 import {
+  attachStudyTimerFeature,
+  initializeStudyTimerTables,
+} from "./study-timer-feature.js";
+import {
   profileImagePostChannelId,
   profileXpPerPost,
 } from "./profile-store.js";
@@ -97,6 +101,7 @@ let stopProfileCommand = () => {};
 let stopTaskListFeature = () => {};
 let stopForestLinkFeature = () => {};
 let stopAuctionFeature = () => {};
+let stopStudyTimerFeature = () => {};
 let botActivityTimer: NodeJS.Timeout | undefined;
 let allowedGuildId: string | undefined;
 const commentMemberRemovalTimers = new Map<string, NodeJS.Timeout>();
@@ -2710,6 +2715,7 @@ async function shutdown(signal: string) {
   stopTaskListFeature();
   stopForestLinkFeature();
   stopAuctionFeature();
+  stopStudyTimerFeature();
   if (botActivityTimer) {
     clearInterval(botActivityTimer);
     botActivityTimer = undefined;
@@ -2737,11 +2743,13 @@ async function main() {
   await initializeTaskListTables(pool);
   await initializeForestLinkTables(pool);
   await initializeAuctionTables(pool);
+  await initializeStudyTimerTables(pool);
   stopDailyPostRewards = attachDailyPostRewards(client, pool);
   stopProfileCommand = attachProfileCommand(client, pool);
   stopTaskListFeature = attachTaskListFeature(client, pool);
   stopForestLinkFeature = attachForestLinkFeature(client, pool);
   stopAuctionFeature = attachAuctionFeature(client, pool);
+  stopStudyTimerFeature = attachStudyTimerFeature(client, pool);
   await client.login(token);
 }
 
@@ -2752,6 +2760,7 @@ void main().catch(async (error: unknown) => {
   stopTaskListFeature();
   stopForestLinkFeature();
   stopAuctionFeature();
+  stopStudyTimerFeature();
   if (botActivityTimer) {
     clearInterval(botActivityTimer);
     botActivityTimer = undefined;
