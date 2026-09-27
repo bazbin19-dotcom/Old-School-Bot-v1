@@ -65,7 +65,10 @@ const formattedMessageChannelIds = [
   "1546491155406135296",
   "1553714914567135312",
 ] as const;
-const whisperChannelId = "1546492836592222279";
+const whisperChannelIds = [
+  "1546492836592222279",
+  "1553713879442526209",
+] as const;
 const databaseUrl = requireEnvironmentValue("DATABASE_URL");
 const retrySourceMessageId = process.env.DISCORD_RETRY_SOURCE_MESSAGE_ID;
 const maxUploadBytes = 8 * 1024 * 1024;
@@ -651,6 +654,12 @@ function makeCommentModal(messageId: string) {
 
 function isWhisperMode(value: string | undefined): value is WhisperMode {
   return value === "anonymous" || value === "identified";
+}
+
+function isWhisperChannelId(
+  channelId: string | null,
+): channelId is (typeof whisperChannelIds)[number] {
+  return whisperChannelIds.some((allowedChannelId) => allowedChannelId === channelId);
 }
 
 function buildWhisperPanelButtons() {
