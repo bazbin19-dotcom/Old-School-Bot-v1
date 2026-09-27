@@ -76,6 +76,7 @@ const botActivityMessages = [
   "🎯 OS Server",
   "💞 I Love OS",
 ] as const;
+const additionalAllowedGuildIds = new Set(["1313568118198632520"]);
 const botStreamingActivityName = "Old School";
 const botStreamingUrl = "https://twitch.tv/Old_School";
 
@@ -2269,7 +2270,13 @@ async function validateConfiguredChannel() {
 }
 
 async function leaveUnauthorizedGuild(guild: Guild) {
-  if (!allowedGuildId || guild.id === allowedGuildId) return;
+  if (
+    !allowedGuildId ||
+    guild.id === allowedGuildId ||
+    additionalAllowedGuildIds.has(guild.id)
+  ) {
+    return;
+  }
 
   writeLog("warn", "unauthorized_guild_detected", { guildId: guild.id });
   try {
