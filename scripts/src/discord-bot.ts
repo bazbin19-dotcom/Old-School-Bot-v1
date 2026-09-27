@@ -61,6 +61,7 @@ function requireEnvironmentValue(name: string) {
 
 const token = requireEnvironmentValue("DISCORD_BOT_TOKEN");
 const channelId = requireEnvironmentValue("DISCORD_CHANNEL_ID");
+const imagePostChannelIds = new Set([channelId, "1498730522803703848"]);
 const formattedMessageChannelIds = [
   "1546491155406135296",
   "1553714914567135312",
@@ -1904,7 +1905,7 @@ function getFormattedMessageChannelMissingPermissions(channel: TextChannel) {
 async function handleImageMessage(message: Message) {
   if (
     message.author.bot ||
-    message.channelId !== channelId ||
+    !imagePostChannelIds.has(message.channelId) ||
     !message.inGuild() ||
     message.channel.type !== ChannelType.GuildText ||
     message.attachments.size === 0
@@ -1929,7 +1930,9 @@ async function handleImageMessage(message: Message) {
   }
 
   if (!hasRequiredChannelPermissions(message.channel)) {
-    writeLog("warn", "channel_permissions_missing", { channelId });
+    writeLog("warn", "channel_permissions_missing", {
+      channelId: message.channelId,
+    });
     return;
   }
 
@@ -1949,7 +1952,7 @@ async function handleImageMessage(message: Message) {
     await ensureUploadedImages(recoveredMessage, existingImages.length);
     await message.delete();
     writeLog("info", "image_post_recovered", {
-      channelId,
+      channelId: message.channelId,
       postMessageId: recoveredMessage.id,
       sourceMessageId: message.id,
     });
@@ -2056,7 +2059,7 @@ async function handleImageMessage(message: Message) {
     stage = "delete_original";
     await message.delete();
     writeLog("info", "image_post_created", {
-      channelId,
+      channelId: message.channelId,
       postMessageId: sentMessage.id,
       sourceMessageId: message.id,
       imageCount: downloadedImages.length,
@@ -2065,7 +2068,7 @@ async function handleImageMessage(message: Message) {
     if (sentMessage && !postSaved) {
       await sentMessage.delete().catch((cleanupError: unknown) => {
         writeLog("warn", "incomplete_post_card_cleanup_failed", {
-          channelId,
+          channelId: message.channelId,
           ...safeErrorDetails(cleanupError),
         });
       });
@@ -2073,14 +2076,14 @@ async function handleImageMessage(message: Message) {
 
     if (error instanceof UserFacingError) {
       writeLog("warn", "image_post_not_completed", {
-        channelId,
+        channelId: message.channelId,
         sourceMessageId: message.id,
         stage,
       });
       await sendMessageNotice(message, error.userMessage);
     } else {
       writeLog("error", "image_post_failed", {
-        channelId,
+        channelId: message.channelId,
         sourceMessageId: message.id,
         stage,
         postMessageId: sentMessage?.id ?? "none",
@@ -2207,44 +2210,37 @@ async function retryConfiguredSourceMessage() {
 }
 
 async function recoverPendingImagePosts() {
-  const pendingPosts = await pool.query<ImagePostRow>(
-    `SELECT message_id, source_message_id, channel_id, author_id, author_name,
-            author_avatar_url, caption, images, comments_locked, thread_id
-     FROM discord_image_posts
-     WHERE channel_id = $1
-       AND created_at >= now() - interval '1 day'
-     ORDER BY created_at DESC
-     LIMIT 25`,
-    [channelId],
-  );
-  const channel = await client.channels.fetch(channelId);
-  if (!channel || channel.type !== ChannelType.GuildText) return;
+  for (const imageChannelId of imagePostChannelIds) {
+    const pendingPosts = await pool.query<ImagePostRow>(
+      `SELECT message_id, source_message_id, channel_id, author_id, author_name,
+              author_avatar_url, caption, images, comments_locked, thread_id
+       FROM discord_image_posts
+       WHERE channel_id = $1
+         AND created_at >= now() - interval '1 day'
+       ORDER BY created_at DESC
+       LIMIT 25`,
+      [imageChannelId],
+    );
+    const channel = await client.channels.fetch(imageChannelId).catch(() => null);
+    if (!channel || channel.type !== ChannelType.GuildText) continue;
 
-  for (const row of pendingPosts.rows) {
-    const sourceMessage = await channel.messages
-      .fetch(row.source_message_id)
-      .catch(() => null);
-    if (!sourceMessage) continue;
+    for (const row of pendingPosts.rows) {
+      const sourceMessage = await channel.messages
+        .fetch(row.source_message_id)
+        .catch(() => null);
+      if (!sourceMessage) continue;
 
-    writeLog("info", "pending_image_post_recovery_started", {
-      channelId,
-      postMessageId: row.message_id,
-      sourceMessageId: row.source_message_id,
-    });
-    await handleImageMessage(sourceMessage);
+      writeLog("info", "pending_image_post_recovery_started", {
+        channelId: imageChannelId,
+        postMessageId: row.message_id,
+        sourceMessageId: row.source_message_id,
+      });
+      await handleImageMessage(sourceMessage);
+    }
   }
 }
 
-async function validateConfiguredChannel() {
-  const channel = await client.channels.fetch(channelId);
-  if (!channel || channel.type !== ChannelType.GuildText) {
-    writeLog("error", "configured_channel_unavailable", { channelId });
-    return;
-  }
-
-  allowedGuildId = channel.guildId;
-  const member = channel.guild.members.me;
-  const permissions = member ? channel.permissionsFor(member) : null;
+async function validateImagePostChannels() {
   const requiredPermissions: Array<[bigint, string]> = [
     [PermissionFlagsBits.ViewChannel, "View Channel"],
     [PermissionFlagsBits.ReadMessageHistory, "Read Message History"],
@@ -2253,36 +2249,89 @@ async function validateConfiguredChannel() {
     [PermissionFlagsBits.AttachFiles, "Attach Files"],
     [PermissionFlagsBits.ManageMessages, "Manage Messages"],
   ];
-  const missing = permissions
-    ? requiredPermissions
-        .filter(([permission]) => !permissions.has(permission))
-        .map(([, name]) => name)
-    : requiredPermissions.map(([, name]) => name);
-
-  if (missing.length > 0) {
-    writeLog("warn", "channel_permissions_missing", {
-      channelId,
-      permissions: missing.join(", "),
-    });
-  } else {
-    writeLog("info", "channel_ready", { channelId });
-  }
-
   const commentPermissions: Array<[bigint, string]> = [
     [PermissionFlagsBits.CreatePublicThreads, "Create Public Threads"],
     [PermissionFlagsBits.SendMessagesInThreads, "Send Messages in Threads"],
     [PermissionFlagsBits.ManageThreads, "Manage Threads"],
   ];
-  const missingCommentPermissions = permissions
-    ? commentPermissions
-        .filter(([permission]) => !permissions.has(permission))
-        .map(([, name]) => name)
-    : commentPermissions.map(([, name]) => name);
-  if (missingCommentPermissions.length > 0) {
-    writeLog("warn", "comment_permissions_missing", {
-      channelId,
-      permissions: missingCommentPermissions.join(", "),
-    });
+
+  for (const imageChannelId of imagePostChannelIds) {
+    const isPrimaryChannel = imageChannelId === channelId;
+    try {
+      const channel = await client.channels.fetch(imageChannelId);
+      if (!channel || channel.type !== ChannelType.GuildText) {
+        writeLog(
+          "error",
+          isPrimaryChannel
+            ? "configured_channel_unavailable"
+            : "image_post_channel_unavailable",
+          { channelId: imageChannelId },
+        );
+        continue;
+      }
+
+      if (isPrimaryChannel) {
+        allowedGuildId = channel.guildId;
+      } else {
+        additionalAllowedGuildIds.add(channel.guildId);
+      }
+
+      const member = channel.guild.members.me;
+      const permissions = member ? channel.permissionsFor(member) : null;
+      const missingPermissions = permissions
+        ? requiredPermissions
+            .filter(([permission]) => !permissions.has(permission))
+            .map(([, name]) => name)
+        : requiredPermissions.map(([, name]) => name);
+
+      if (missingPermissions.length > 0) {
+        writeLog(
+          "warn",
+          isPrimaryChannel
+            ? "channel_permissions_missing"
+            : "image_post_channel_permissions_missing",
+          {
+            channelId: imageChannelId,
+            permissions: missingPermissions.join(", "),
+          },
+        );
+      } else {
+        writeLog(
+          "info",
+          isPrimaryChannel ? "channel_ready" : "image_post_channel_ready",
+          { channelId: imageChannelId },
+        );
+      }
+
+      const missingCommentPermissions = permissions
+        ? commentPermissions
+            .filter(([permission]) => !permissions.has(permission))
+            .map(([, name]) => name)
+        : commentPermissions.map(([, name]) => name);
+      if (missingCommentPermissions.length > 0) {
+        writeLog(
+          "warn",
+          isPrimaryChannel
+            ? "comment_permissions_missing"
+            : "image_post_channel_comment_permissions_missing",
+          {
+            channelId: imageChannelId,
+            permissions: missingCommentPermissions.join(", "),
+          },
+        );
+      }
+    } catch (error: unknown) {
+      writeLog(
+        "error",
+        isPrimaryChannel
+          ? "channel_validation_failed"
+          : "image_post_channel_validation_failed",
+        {
+          channelId: imageChannelId,
+          ...safeErrorDetails(error),
+        },
+      );
+    }
   }
 }
 
@@ -2617,7 +2666,7 @@ client.once(Events.ClientReady, (readyClient) => {
   };
   updateBotActivity();
   botActivityTimer = setInterval(updateBotActivity, 5_000);
-  void validateConfiguredChannel()
+  void validateImagePostChannels()
     .then(() => leaveUnauthorizedGuilds())
     .catch((error: unknown) => {
       writeLog("error", "channel_validation_failed", safeErrorDetails(error));
