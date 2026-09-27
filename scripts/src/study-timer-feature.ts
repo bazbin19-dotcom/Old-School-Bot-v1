@@ -162,7 +162,7 @@ export function formatStudyTimerTime(milliseconds: number) {
   const totalSeconds = Math.max(0, Math.ceil(milliseconds / 1_000));
   const totalMinutes = Math.floor(totalSeconds / 60);
   const seconds = totalSeconds % 60;
-  return `${String(totalMinutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}`;
+  return `${totalMinutes}:${String(seconds).padStart(2, "0")}`;
 }
 
 export function buildStudyTimerContainer(
@@ -183,7 +183,7 @@ export function buildStudyTimerContainer(
   const timeRemaining = formatStudyTimerTime(state.phaseEndsAtMs - nowMs);
   const altDescription = `${phaseLabel}: ${timeRemaining}. Theme: ${theme.icon} ${theme.name} theme.`;
   const information = [
-    `${phaseIcon} ${phaseLabel}`,
+    `**${phaseIcon} ${phaseLabel}**`,
     `⏱️ Time Remaining: **${timeRemaining}**`,
     `🎨 Theme: ${theme.icon} ${theme.name} theme`,
   ].join("\n");
@@ -196,6 +196,7 @@ export function buildStudyTimerContainer(
   );
 
   return new ContainerBuilder()
+    .setAccentColor(0xc64b58)
     .addMediaGalleryComponents(
       new MediaGalleryBuilder().addItems({
         media: { url: `attachment://${fileName}` },

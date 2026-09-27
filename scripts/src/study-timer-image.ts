@@ -9,13 +9,6 @@ import {
 const imageWidth = 1_200;
 const imageHeight = 560;
 const lobsterFontUrl = new URL("../assets/fonts/Lobster-Regular.ttf", import.meta.url);
-const edgeZones = [
-  { minX: 34, maxX: 180, minY: 45, maxY: 510 },
-  { minX: 1_020, maxX: 1_166, minY: 45, maxY: 510 },
-  { minX: 220, maxX: 430, minY: 28, maxY: 88 },
-  { minX: 770, maxX: 980, minY: 28, maxY: 88 },
-  { minX: 235, maxX: 965, minY: 488, maxY: 526 },
-] as const;
 
 let fontPromise: Promise<Font> | null = null;
 
@@ -110,19 +103,39 @@ function renderMotif(
   }
 }
 
-function renderEdgeDecorations(
+function renderScatteredDecorations(
   theme: NonNullable<ReturnType<typeof getStudyTimerTheme>>,
 ) {
   const random = seededRandom(theme.key);
-  return Array.from({ length: 25 }, (_, index) => {
-    const zone = edgeZones[index % edgeZones.length]!;
-    const x = zone.minX + random() * (zone.maxX - zone.minX);
-    const y = zone.minY + random() * (zone.maxY - zone.minY);
-    const size = 10 + random() * 11;
-    const rotation = Math.round(random() * 360);
-    const opacity = (0.48 + random() * 0.28).toFixed(2);
-    return `<g transform="translate(${x.toFixed(1)} ${y.toFixed(1)}) rotate(${rotation}) scale(${size.toFixed(1)})" opacity="${opacity}">${renderMotif(theme.motif, theme.primary, theme.highlight, theme.background)}</g>`;
-  }).join("");
+  const decorations: Array<{ x: number; y: number; size: number }> = [];
+  let attempts = 0;
+
+  while (decorations.length < 32 && attempts < 2_000) {
+    attempts += 1;
+    const x = 38 + random() * (imageWidth - 76);
+    const y = 34 + random() * (imageHeight - 68);
+    const titleArea = x > 450 && x < 750 && y < 140;
+    const timerArea = x > 285 && x < 915 && y > 165 && y < 410;
+    const bookArea = x > 1_030 && y < 110;
+    if (titleArea || timerArea || bookArea) continue;
+
+    const size = 8 + random() * 7;
+    const crowded = decorations.some(
+      (decoration) =>
+        Math.hypot(decoration.x - x, decoration.y - y) <
+        decoration.size + size + 12,
+    );
+    if (crowded) continue;
+    decorations.push({ x, y, size });
+  }
+
+  return decorations
+    .map(({ x, y, size }) => {
+      const rotation = Math.round(random() * 360);
+      const opacity = (0.3 + random() * 0.23).toFixed(2);
+      return `<g transform="translate(${x.toFixed(1)} ${y.toFixed(1)}) rotate(${rotation}) scale(${size.toFixed(1)})" opacity="${opacity}">${renderMotif(theme.motif, theme.primary, theme.highlight, theme.background)}</g>`;
+    })
+    .join("");
 }
 
 function centerTextPath(font: Font, text: string, fontSize: number, baseline: number) {
@@ -149,7 +162,7 @@ export async function renderStudyTimerImage(
   const titlePath = centerTextPath(font, "TIMER", 50, 105);
   const timeFontSize = timeRemaining.length >= 7 ? 132 : 150;
   const timePath = centerTextPath(font, timeRemaining, timeFontSize, 350);
-  const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="${imageWidth}" height="${imageHeight}" viewBox="0 0 ${imageWidth} ${imageHeight}"><defs><clipPath id="rounded"><rect width="${imageWidth}" height="${imageHeight}" rx="38"/></clipPath></defs><g clip-path="url(#rounded)"><rect width="${imageWidth}" height="${imageHeight}" fill="${theme.background}"/><ellipse cx="84" cy="278" rx="125" ry="230" fill="${theme.highlight}" opacity=".16"/><ellipse cx="1116" cy="275" rx="112" ry="220" fill="${theme.highlight}" opacity=".18"/>${renderEdgeDecorations(theme)}${renderBookIcon(theme.primary, theme.highlight)}<path d="${titlePath}" transform="translate(0 2)" fill="${theme.highlight}" opacity=".55"/><path d="${titlePath}" fill="${theme.text}"/><path d="${timePath}" transform="translate(0 7)" fill="${theme.highlight}" opacity=".72"/><path d="${timePath}" fill="${theme.text}"/></g></svg>`;
+  const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="${imageWidth}" height="${imageHeight}" viewBox="0 0 ${imageWidth} ${imageHeight}"><defs><linearGradient id="pastel-wash" x1="0%" y1="0%" x2="100%" y2="100%"><stop offset="0%" stop-color="${theme.highlight}" stop-opacity=".1"/><stop offset="100%" stop-color="${theme.primary}" stop-opacity=".035"/></linearGradient><clipPath id="rounded"><rect width="${imageWidth}" height="${imageHeight}" rx="38"/></clipPath></defs><g clip-path="url(#rounded)"><rect width="${imageWidth}" height="${imageHeight}" fill="${theme.background}"/><rect width="${imageWidth}" height="${imageHeight}" fill="url(#pastel-wash)"/>${renderScatteredDecorations(theme)}${renderBookIcon(theme.primary, theme.highlight)}<path d="${titlePath}" transform="translate(0 2)" fill="${theme.highlight}" opacity=".55"/><path d="${titlePath}" fill="${theme.text}"/><path d="${timePath}" transform="translate(0 7)" fill="${theme.highlight}" opacity=".72"/><path d="${timePath}" fill="${theme.text}"/></g></svg>`;
   return sharp(Buffer.from(svg))
     .png({ compressionLevel: 9 })
     .toBuffer();
