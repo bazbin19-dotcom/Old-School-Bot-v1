@@ -52,6 +52,33 @@ function starPath(points = 5) {
   return `M${vertices.join(" L")} Z`;
 }
 
+function pathToSvgData(path: ReturnType<Font["getPath"]>) {
+  const format = (value: number) => {
+    if (!Number.isFinite(value)) {
+      throw new Error("The study timer font produced invalid path coordinates.");
+    }
+    return String(Number(value.toFixed(2)));
+  };
+
+  return path.commands
+    .map((command) => {
+      switch (command.type) {
+        case "M":
+        case "L":
+          return `${command.type}${format(command.x)} ${format(command.y)}`;
+        case "Q":
+          return `Q${format(command.x1)} ${format(command.y1)} ${format(command.x)} ${format(command.y)}`;
+        case "C":
+          return `C${format(command.x1)} ${format(command.y1)} ${format(command.x2)} ${format(command.y2)} ${format(command.x)} ${format(command.y)}`;
+        case "Z":
+          return "Z";
+        default:
+          throw new Error("The study timer font produced an unsupported path command.");
+      }
+    })
+    .join("");
+}
+
 function renderMotif(
   motif: string,
   primary: string,
@@ -138,14 +165,34 @@ function renderScatteredDecorations(
     .join("");
 }
 
-function centerTextPath(font: Font, text: string, fontSize: number, baseline: number) {
+function centerTextPath(
+  font: Font,
+  text: string,
+  fontSize: number,
+  baseline: number,
+) {
   const width = font.getAdvanceWidth(text, fontSize);
   const x = (imageWidth - width) / 2;
-  return font.getPath(text, x, baseline, fontSize).toPathData(2);
+  return pathToSvgData(font.getPath(text, x, baseline, fontSize));
+}
+
+function centerTimerDigitPaths(
+  font: Font,
+  text: string,
+  fontSize: number,
+  baseline: number,
+) {
+  const tracking = 60;
+  const options = { tracking };
+  const width = font.getAdvanceWidth(text, fontSize, options);
+  const x = (imageWidth - width) / 2;
+  return font
+    .getPaths(text, x, baseline, fontSize, options)
+    .map(pathToSvgData);
 }
 
 function renderBookIcon(color: string, detailColor: string) {
-  return `<g transform="translate(1108 56)" fill="none" stroke="${color}" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"><path d="M0 4C-14-4-29-6-43-1V35C-28 30-13 33 0 42C13 33 28 30 43 35V-1C29-6 14-4 0 4Z" fill="${detailColor}" fill-opacity=".26"/><path d="M0 4V42M-33 7C-24 5-15 8-8 12M33 7C24 5 15 8 8 12"/></g>`;
+  return `<g transform="translate(1128 60) scale(.46)" fill="none" stroke="${color}" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"><path d="M0 4C-14-4-29-6-43-1V35C-28 30-13 33 0 42C13 33 28 30 43 35V-1C29-6 14-4 0 4Z" fill="${detailColor}" fill-opacity=".26"/><path d="M0 4V42M-33 7C-24 5-15 8-8 12M33 7C24 5 15 8 8 12"/></g>`;
 }
 
 export async function renderStudyTimerImage(
@@ -159,10 +206,13 @@ export async function renderStudyTimerImage(
   }
 
   const font = await loadLobsterFont();
-  const titlePath = centerTextPath(font, "TIMER", 50, 105);
-  const timeFontSize = timeRemaining.length >= 7 ? 132 : 150;
-  const timePath = centerTextPath(font, timeRemaining, timeFontSize, 350);
-  const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="${imageWidth}" height="${imageHeight}" viewBox="0 0 ${imageWidth} ${imageHeight}"><defs><linearGradient id="pastel-wash" x1="0%" y1="0%" x2="100%" y2="100%"><stop offset="0%" stop-color="${theme.highlight}" stop-opacity=".1"/><stop offset="100%" stop-color="${theme.primary}" stop-opacity=".035"/></linearGradient><clipPath id="rounded"><rect width="${imageWidth}" height="${imageHeight}" rx="38"/></clipPath></defs><g clip-path="url(#rounded)"><rect width="${imageWidth}" height="${imageHeight}" fill="${theme.background}"/><rect width="${imageWidth}" height="${imageHeight}" fill="url(#pastel-wash)"/>${renderScatteredDecorations(theme)}${renderBookIcon(theme.primary, theme.highlight)}<path d="${titlePath}" transform="translate(0 2)" fill="${theme.highlight}" opacity=".55"/><path d="${titlePath}" fill="${theme.text}"/><path d="${timePath}" transform="translate(0 7)" fill="${theme.highlight}" opacity=".72"/><path d="${timePath}" fill="${theme.text}"/></g></svg>`;
+  const titlePath = centerTextPath(font, "TIMER", 44, 105);
+  const timeFontSize = timeRemaining.length >= 7 ? 140 : 175;
+  const timePaths = centerTimerDigitPaths(font, timeRemaining, timeFontSize, 350);
+  const timerTextSvg = timePaths
+    .map((path) => `<path d="${path}" fill="${theme.text}"/>`)
+    .join("");
+  const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="${imageWidth}" height="${imageHeight}" viewBox="0 0 ${imageWidth} ${imageHeight}"><defs><linearGradient id="pastel-wash" x1="0%" y1="0%" x2="100%" y2="100%"><stop offset="0%" stop-color="${theme.highlight}" stop-opacity=".1"/><stop offset="100%" stop-color="${theme.primary}" stop-opacity=".035"/></linearGradient><clipPath id="rounded"><rect width="${imageWidth}" height="${imageHeight}" rx="38"/></clipPath></defs><g clip-path="url(#rounded)"><rect width="${imageWidth}" height="${imageHeight}" fill="${theme.background}"/><rect width="${imageWidth}" height="${imageHeight}" fill="url(#pastel-wash)"/>${renderScatteredDecorations(theme)}${renderBookIcon(theme.primary, theme.highlight)}<path d="${titlePath}" fill="${theme.text}"/>${timerTextSvg}</g></svg>`;
   return sharp(Buffer.from(svg))
     .png({ compressionLevel: 9 })
     .toBuffer();
