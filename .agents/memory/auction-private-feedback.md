@@ -1,10 +1,10 @@
 ---
-name: Auction private feedback
-description: Privacy expectations for setup and rejected-bid feedback in the Discord auction channel.
+name: Auction ephemeral feedback
+description: Privacy expectations and Discord interaction constraints for auction setup and bid warnings.
 ---
 
-Auction setup and rejected-bid explanations are sent in private threads attached to the auction channel. Server moderators may still see those threads. If private-thread delivery fails, use a direct message fallback rather than posting the explanation publicly.
+Auction setup and rejected-bid explanations must use ephemeral interaction responses in the auction channel. Do not use private threads or DMs. A normal message event cannot receive an ephemeral response, so a public launcher button after the authorized «مزاد» message opens the private setup controls. Bids use a button and modal; accepted amounts are posted publicly by the bot.
 
-**Why:** Ordinary channel messages cannot receive ephemeral replies; the user chose private threads and accepted moderator visibility.
+**Why:** The user explicitly chose ephemeral setup and rejection feedback in the same channel, with accepted bids and auction announcements visible publicly.
 
-**How to apply:** Keep all non-public auction setup and rejection feedback in a private thread or DM. Do not describe these threads as invisible to moderators.
+**How to apply:** Keep «مزاد» as the role-gated message trigger, then require a button interaction before showing ephemeral setup. Use bid modals for private validation feedback and publish only accepted amounts, start/end announcements, and winner details. Never add slash commands, threads, or DMs to this flow.

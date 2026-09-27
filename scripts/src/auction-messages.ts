@@ -11,7 +11,6 @@ import {
 } from "discord.js";
 import {
   formatAuctionAmount,
-  formatAuctionDuration,
 } from "./auction-parsing.js";
 
 export type AuctionPanelValues = {
@@ -33,8 +32,7 @@ export function makeAuctionSetupPanel(
       .setCustomId(`auction:field:duration:${auctionId}:${sessionId}`)
       .setLabel("المدة")
       .setEmoji("⏱️")
-      .setStyle(ButtonStyle.Secondary)
-      ,
+      .setStyle(ButtonStyle.Secondary),
     new ButtonBuilder()
       .setCustomId(`auction:field:price:${auctionId}:${sessionId}`)
       .setLabel("سعر البدء")
