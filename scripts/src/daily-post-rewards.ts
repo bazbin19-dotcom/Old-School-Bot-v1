@@ -3,6 +3,7 @@ import {
   Events,
   PermissionFlagsBits,
   type Client,
+  type DMChannel,
   type Guild,
   type GuildMember,
   type Message,
@@ -31,8 +32,13 @@ const rewardChannelIds = new Set([
   "1546922464301416478",
   "1546491554892484669",
   "1546491651198034020",
+  "1553714914567135312",
+  "1553713879442526209",
+  "1498730522803703848",
 ]);
 const streakNoticeChannelId = "1546917729695432795";
+const privateStreakNoticeGuildIds = new Set(["1313568118198632520"]);
+const rewardGuildIds = new Set<string>();
 
 const dateFormatter = new Intl.DateTimeFormat("en-GB", {
   timeZone: "Asia/Baghdad",
@@ -108,6 +114,20 @@ async function getStreakNoticeChannel(client: Client): Promise<TextChannel> {
     throw new Error("The configured streak-notice channel is unavailable.");
   }
   return channel;
+}
+
+async function getStreakDeliveryChannel(
+  client: Client,
+  guildId: string,
+  userId: string,
+): Promise<TextChannel | DMChannel | null> {
+  if (privateStreakNoticeGuildIds.has(guildId)) {
+    const user = await client.users.fetch(userId);
+    return user.createDM();
+  }
+
+  const noticeChannel = await getStreakNoticeChannel(client);
+  return noticeChannel.guildId === guildId ? noticeChannel : null;
 }
 
 async function sendStreakNoticeOnce(
@@ -592,8 +612,12 @@ async function updateMemberDailyRole(
     }
 
     try {
-      const noticeChannel = await getStreakNoticeChannel(client);
-      if (noticeChannel.guildId === guild.id) {
+      const deliveryChannel = await getStreakDeliveryChannel(
+        client,
+        guild.id,
+        message.author.id,
+      );
+      if (deliveryChannel) {
         await sendStreakNoticeOnce(
           pool,
           guild.id,
@@ -602,7 +626,7 @@ async function updateMemberDailyRole(
           "renewed",
           () =>
             sendStreakRenewedMessage(
-              noticeChannel,
+              deliveryChannel,
               message.author.id,
               streakDays,
             ),
@@ -612,7 +636,9 @@ async function updateMemberDailyRole(
       logRoleFailure("daily_streak_renewal_notice_failed", error, {
         guildId: guild.id,
         userId: message.author.id,
-        channelId: streakNoticeChannelId,
+        channelId: privateStreakNoticeGuildIds.has(guild.id)
+          ? "direct-message"
+          : streakNoticeChannelId,
       });
     }
   });
@@ -794,10 +820,14 @@ async function sendPendingRecoveryCardForUser(
     return false;
   }
 
-  const channel = await getStreakNoticeChannel(client);
-  if (channel.guildId !== guildId) return false;
+  const deliveryChannel = await getStreakDeliveryChannel(
+    client,
+    guildId,
+    userId,
+  );
+  if (!deliveryChannel) return false;
   const message = await sendExpiredStreakMessage(
-    channel,
+    deliveryChannel,
     userId,
     state.expired_streak_days,
     state.recovery_expires_at,
@@ -815,15 +845,16 @@ async function sendPendingRecoveryCardForUser(
 }
 
 async function sendPendingRecoveryCards(client: Client, pool: Pool) {
-  const channel = await getStreakNoticeChannel(client);
+  const guildIds = [...rewardGuildIds];
+  if (guildIds.length === 0) return;
   const pending = await pool.query<{ guild_id: string; user_id: string }>(
     `SELECT guild_id, user_id
      FROM discord_daily_post_streaks
-     WHERE guild_id = $1
+     WHERE guild_id = ANY($1::text[])
        AND expired_streak_days > 0
        AND recovery_expires_at > now()
        AND recovery_message_id IS NULL`,
-    [channel.guildId],
+    [guildIds],
   );
 
   for (const row of pending.rows) {
@@ -840,7 +871,9 @@ async function sendPendingRecoveryCards(client: Client, pool: Pool) {
       logRoleFailure("daily_streak_recovery_notice_failed", error, {
         guildId: row.guild_id,
         userId: row.user_id,
-        channelId: streakNoticeChannelId,
+        channelId: privateStreakNoticeGuildIds.has(row.guild_id)
+          ? "direct-message"
+          : streakNoticeChannelId,
       });
     }
   }
@@ -852,57 +885,77 @@ async function sendStreakReminders(
   today: string,
   kind: "three_hours" | "one_hour",
 ) {
-  const channel = await getStreakNoticeChannel(client);
-  const guild = await client.guilds.fetch(channel.guildId);
-  const rows = await pool.query<{ user_id: string; streak_days: number }>(
-    `SELECT user_id, streak_days
-     FROM discord_daily_post_streaks
-     WHERE guild_id = $1
-       AND streak_days > 0
-       AND last_post_date < $2::date`,
-    [guild.id, today],
-  );
   const noticeKind = kind === "three_hours" ? "reminder_3h" : "reminder_1h";
 
-  for (const row of rows.rows) {
+  for (const guildId of rewardGuildIds) {
     try {
-      await withMemberQueue(guild.id, row.user_id, async () => {
-        const current = await pool.query<DailyStreakRow>(
-          `SELECT streak_days, last_post_date::text AS last_post_date
-           FROM discord_daily_post_streaks
-           WHERE guild_id = $1 AND user_id = $2`,
-          [guild.id, row.user_id],
-        );
-        const currentState = current.rows[0];
-        if (
-          !currentState ||
-          currentState.streak_days < 1 ||
-          currentState.last_post_date >= today
-        ) {
-          return;
-        }
-        await guild.members.fetch(row.user_id);
-        await sendStreakNoticeOnce(
-          pool,
-          guild.id,
-          row.user_id,
-          today,
-          noticeKind,
-          () =>
-            sendStreakReminderMessage(
-              channel,
+      const guild = await client.guilds.fetch(guildId);
+      const rows = await pool.query<{ user_id: string; streak_days: number }>(
+        `SELECT user_id, streak_days
+         FROM discord_daily_post_streaks
+         WHERE guild_id = $1
+           AND streak_days > 0
+           AND last_post_date < $2::date`,
+        [guild.id, today],
+      );
+
+      for (const row of rows.rows) {
+        try {
+          await withMemberQueue(guild.id, row.user_id, async () => {
+            const current = await pool.query<DailyStreakRow>(
+              `SELECT streak_days, last_post_date::text AS last_post_date
+               FROM discord_daily_post_streaks
+               WHERE guild_id = $1 AND user_id = $2`,
+              [guild.id, row.user_id],
+            );
+            const currentState = current.rows[0];
+            if (
+              !currentState ||
+              currentState.streak_days < 1 ||
+              currentState.last_post_date >= today
+            ) {
+              return;
+            }
+            await guild.members.fetch(row.user_id);
+            const deliveryChannel = await getStreakDeliveryChannel(
+              client,
+              guild.id,
               row.user_id,
-              currentState.streak_days,
-              kind,
-            ),
-        );
-      });
+            );
+            if (!deliveryChannel) return;
+            await sendStreakNoticeOnce(
+              pool,
+              guild.id,
+              row.user_id,
+              today,
+              noticeKind,
+              () =>
+                sendStreakReminderMessage(
+                  deliveryChannel,
+                  row.user_id,
+                  currentState.streak_days,
+                  kind,
+                ),
+            );
+          });
+        } catch (error) {
+          if (isDiscordErrorCode(error, 10007)) continue;
+          logRoleFailure("daily_streak_reminder_failed", error, {
+            guildId: guild.id,
+            userId: row.user_id,
+            channelId: privateStreakNoticeGuildIds.has(guild.id)
+              ? "direct-message"
+              : streakNoticeChannelId,
+            reminder: kind,
+          });
+        }
+      }
     } catch (error) {
-      if (isDiscordErrorCode(error, 10007)) continue;
-      logRoleFailure("daily_streak_reminder_failed", error, {
-        guildId: guild.id,
-        userId: row.user_id,
-        channelId: streakNoticeChannelId,
+      logRoleFailure("daily_streak_reminder_guild_failed", error, {
+        guildId,
+        channelId: privateStreakNoticeGuildIds.has(guildId)
+          ? "direct-message"
+          : streakNoticeChannelId,
         reminder: kind,
       });
     }
@@ -924,11 +977,7 @@ async function handleStreakRecovery(
     return;
   }
 
-  if (
-    interaction.channelId !== streakNoticeChannelId ||
-    !interaction.guildId ||
-    interaction.message.author.id !== client.user?.id
-  ) {
+  if (interaction.message.author.id !== client.user?.id) {
     await interaction.reply({
       content: "رسالة استرداد الستريك هذه لم تعد متاحة.",
       ephemeral: true,
@@ -945,8 +994,34 @@ async function handleStreakRecovery(
     return;
   }
 
+  const recoveryOwner = await pool.query<{ guild_id: string }>(
+    `SELECT guild_id
+     FROM discord_daily_post_streaks
+     WHERE user_id = $1
+       AND recovery_message_id = $2`,
+    [ownerId, interaction.message.id],
+  );
+  const guildId = recoveryOwner.rows[0]?.guild_id;
+  const isGuildRecoveryMessage =
+    guildId !== undefined &&
+    Boolean(interaction.guildId) &&
+    interaction.channelId === streakNoticeChannelId &&
+    interaction.guildId === guildId;
+  const isPrivateRecoveryMessage =
+    guildId !== undefined &&
+    !interaction.guildId &&
+    privateStreakNoticeGuildIds.has(guildId);
+  if (!guildId || (!isGuildRecoveryMessage && !isPrivateRecoveryMessage)) {
+    await interaction.reply({
+      content: "رسالة استرداد الستريك هذه لم تعد متاحة.",
+      ephemeral: true,
+      allowedMentions: { parse: [] },
+    });
+    return;
+  }
+
   await interaction.deferReply({ ephemeral: true });
-  await withMemberQueue(interaction.guildId, ownerId, async () => {
+  await withMemberQueue(guildId, ownerId, async () => {
     const result = await pool.query<RecoveryStateRow>(
       `SELECT streak_days,
               last_post_date::text AS last_post_date,
@@ -955,7 +1030,7 @@ async function handleStreakRecovery(
               recovery_message_id
        FROM discord_daily_post_streaks
        WHERE guild_id = $1 AND user_id = $2`,
-      [interaction.guildId, ownerId],
+      [guildId, ownerId],
     );
     const state = result.rows[0];
     if (
@@ -988,7 +1063,7 @@ async function handleStreakRecovery(
          AND recovery_expires_at > now()
        RETURNING streak_days`,
       [
-        interaction.guildId,
+        guildId,
         ownerId,
         interaction.message.id,
         activityDate,
@@ -1003,7 +1078,7 @@ async function handleStreakRecovery(
     }
 
     try {
-      const guild = await client.guilds.fetch(interaction.guildId!);
+      const guild = await client.guilds.fetch(guildId);
       const member = await guild.members.fetch(ownerId);
       await assignDailyRole(guild, pool, member, restoredDays);
     } catch (error) {
@@ -1021,7 +1096,7 @@ async function handleStreakRecovery(
            AND recovery_message_id IS NULL
            AND expired_streak_days = 0`,
         [
-          interaction.guildId,
+          guildId,
           ownerId,
           interaction.message.id,
           state.streak_days,
@@ -1170,9 +1245,13 @@ async function validateDailyRewardAccess(client: Client) {
   );
 
   const guildIds = new Set<string>();
+  rewardGuildIds.clear();
   for (const channel of channels) {
     if (channel.guildId) {
       guildIds.add(channel.guildId);
+      if (channel.channelId !== streakNoticeChannelId) {
+        rewardGuildIds.add(channel.guildId);
+      }
     } else {
       console.error(
         JSON.stringify({
@@ -1326,9 +1405,9 @@ export function attachDailyPostRewards(client: Client, pool: Pool) {
   const onReady = () => {
     if (cleanupTimer) return;
     void ensureBotAvailabilityInitialized(pool)
-      .then(() => {
-        void validateDailyRewardAccess(client);
-        void runStreakMaintenance(client, pool);
+      .then(async () => {
+        await validateDailyRewardAccess(client);
+        await runStreakMaintenance(client, pool);
       })
       .catch((error: unknown) => {
         logRoleFailure("daily_streak_heartbeat_failed", error, {});

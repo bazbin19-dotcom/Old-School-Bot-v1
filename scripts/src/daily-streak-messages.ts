@@ -11,6 +11,7 @@ import {
   SeparatorSpacingSize,
   TextDisplayBuilder,
   ThumbnailBuilder,
+  type DMChannel,
   type Message,
   type TextChannel,
 } from "discord.js";
@@ -72,7 +73,7 @@ function createStreakPanel(
 }
 
 export async function sendStreakRenewedMessage(
-  channel: TextChannel,
+  channel: TextChannel | DMChannel,
   userId: string,
   streakDays: number,
 ) {
@@ -102,7 +103,7 @@ export async function sendStreakRenewedMessage(
 }
 
 export async function sendStreakReminderMessage(
-  channel: TextChannel,
+  channel: TextChannel | DMChannel,
   userId: string,
   streakDays: number,
   kind: StreakReminderKind,
@@ -137,7 +138,7 @@ export async function sendStreakReminderMessage(
 }
 
 export async function sendExpiredStreakMessage(
-  channel: TextChannel,
+  channel: TextChannel | DMChannel,
   userId: string,
   streakDays: number,
   recoveryDeadline: Date,
