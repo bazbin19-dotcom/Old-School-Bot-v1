@@ -23,7 +23,18 @@ import {
 } from "discord.js";
 import type { Pool } from "pg";
 
-export const taskListChannelId = "1546779645314203659";
+export const taskListChannelIds = [
+  "1546779645314203659",
+  "1553874151956156437",
+] as const;
+
+function isTaskListChannel(
+  channelId: string | null | undefined,
+): channelId is string {
+  return taskListChannelIds.some(
+    (taskListChannelId) => taskListChannelId === channelId,
+  );
+}
 
 const maxTaskCount = 25;
 const maxTaskLength = 100;
@@ -283,22 +294,20 @@ async function loadOwnedTaskList(
     | ModalSubmitInteraction,
   messageId: string,
 ): Promise<TaskListContext | null> {
-  if (
-    interaction.channelId !== taskListChannelId ||
-    !interaction.guildId
-  ) {
+  if (!isTaskListChannel(interaction.channelId) || !interaction.guildId) {
     return null;
   }
   const list = await getTaskList(pool, messageId);
   if (
     !list ||
     list.guild_id !== interaction.guildId ||
-    list.channel_id !== taskListChannelId ||
+    list.channel_id !== interaction.channelId ||
+    !isTaskListChannel(list.channel_id) ||
     list.owner_id !== interaction.user.id
   ) {
     return null;
   }
-  const channel = await client.channels.fetch(taskListChannelId);
+  const channel = await client.channels.fetch(list.channel_id);
   if (!channel || channel.type !== ChannelType.GuildText) return null;
   const message = await channel.messages.fetch(messageId).catch(() => null);
   if (!message || message.author.id !== client.user?.id) return null;
@@ -370,7 +379,7 @@ async function handleTaskListMessage(
   if (
     !source.inGuild() ||
     source.author.bot ||
-    source.channelId !== taskListChannelId
+    !isTaskListChannel(source.channelId)
   ) {
     return;
   }
@@ -703,18 +712,22 @@ async function handleTaskListInteraction(
 }
 
 async function validateTaskListChannel(client: Client) {
-  const channel = await client.channels.fetch(taskListChannelId);
-  if (!channel || channel.type !== ChannelType.GuildText) {
-    throw new Error("The configured task-list channel is unavailable.");
+  for (const channelId of taskListChannelIds) {
+    const channel = await client.channels.fetch(channelId);
+    if (!channel || channel.type !== ChannelType.GuildText) {
+      throw new Error(
+        `The configured task-list channel ${channelId} is unavailable.`,
+      );
+    }
+    process.stdout.write(
+      `${JSON.stringify({
+        level: "info",
+        event: "task_list_channel_ready",
+        timestamp: new Date().toISOString(),
+        channelId,
+      })}\n`,
+    );
   }
-  process.stdout.write(
-    `${JSON.stringify({
-      level: "info",
-      event: "task_list_channel_ready",
-      timestamp: new Date().toISOString(),
-      channelId: taskListChannelId,
-    })}\n`,
-  );
 }
 
 export function attachTaskListFeature(client: Client, pool: Pool) {
@@ -722,7 +735,7 @@ export function attachTaskListFeature(client: Client, pool: Pool) {
     void handleTaskListMessage(client, pool, message).catch((error: unknown) => {
       logTaskListError("task_list_message_failed", error);
       if (
-        message.channelId === taskListChannelId &&
+        isTaskListChannel(message.channelId) &&
         !message.author.bot
       ) {
         void message
