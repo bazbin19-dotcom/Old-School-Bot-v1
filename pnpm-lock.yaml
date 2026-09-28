@@ -458,6 +458,9 @@ importers:
       sharp:
         specifier: ^0.35.4
         version: 0.35.4(@types/node@25.9.6)
+      tsx:
+        specifier: 'catalog:'
+        version: 4.23.13
     devDependencies:
       '@types/node':
         specifier: 'catalog:'
@@ -468,9 +471,6 @@ importers:
       '@types/pg':
         specifier: ^8.23.1
         version: 8.23.1
-      tsx:
-        specifier: 'catalog:'
-        version: 4.23.13
 
 packages:
 
