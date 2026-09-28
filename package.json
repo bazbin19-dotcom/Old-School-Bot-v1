@@ -3,13 +3,16 @@
   "version": "0.0.0",
   "license": "MIT",
   "scripts": {
-    "preinstall": "sh -c 'rm -f package-lock.json yarn.lock; case \"$npm_config_user_agent\" in pnpm/*) ;; *) echo \"Use pnpm instead\" >&2; exit 1 ;; esac'",
+    "preinstall": "sh -c 'rm -f package-lock.json yarn.lock; case \"$npm_config_user_agent\" in pnpm/*|npm/*) ;; *) echo \"Use pnpm or npm\" >&2; exit 1 ;; esac'",
     "build": "pnpm run typecheck && pnpm -r --if-present run build",
-    "start": "pnpm --filter @workspace/scripts run discord-bot",
+    "start": "npm run discord-bot --workspace=@workspace/scripts",
     "typecheck:libs": "tsc --build",
     "typecheck": "pnpm run typecheck:libs && pnpm -r --filter \"./artifacts/**\" --filter \"./scripts\" --if-present run typecheck"
   },
   "packageManager": "pnpm@10.26.1",
+  "workspaces": [
+    "scripts"
+  ],
   "private": true,
   "dependencies": {
     "@replit/connectors-sdk": "^0.4.3"
