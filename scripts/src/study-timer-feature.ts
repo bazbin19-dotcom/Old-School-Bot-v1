@@ -62,6 +62,7 @@ type StudyTimerState = {
   phaseEndsAtMs: number;
   timeout: NodeJS.Timeout | null;
   inFlight: boolean;
+  pendingMoveMessage: Message | null;
   cancelled: boolean;
   retryDelayMs: number;
 };
@@ -292,6 +293,31 @@ function scheduleTimerUpdate(
   state.timeout.unref();
 }
 
+function finishTimerOperation(
+  client: Client,
+  pool: PgPool,
+  state: StudyTimerState,
+) {
+  state.inFlight = false;
+  if (state.cancelled || !activeTimers.has(state.id)) return;
+
+  const pendingMoveMessage = state.pendingMoveMessage;
+  state.pendingMoveMessage = null;
+  if (pendingMoveMessage) {
+    void moveTimerBelowMessage(client, pool, state, pendingMoveMessage).catch(
+      (error: unknown) => {
+        logTimerError("study_timer_reposition_failed", error, {
+          timerId: state.id,
+          channelId: state.channelId,
+        });
+      },
+    );
+    return;
+  }
+
+  scheduleTimerUpdate(client, pool, state);
+}
+
 async function markTimerComplete(pool: PgPool, state: StudyTimerState) {
   await pool.query(
     `UPDATE discord_study_timers
@@ -368,8 +394,105 @@ async function updateTimer(
       phase: state.phase,
     });
   } finally {
-    state.inFlight = false;
-    scheduleTimerUpdate(client, pool, state);
+    finishTimerOperation(client, pool, state);
+  }
+}
+
+async function moveTimerBelowMessage(
+  client: Client,
+  pool: PgPool,
+  state: StudyTimerState,
+  triggerMessage: Message,
+) {
+  if (
+    state.cancelled ||
+    !activeTimers.has(state.id) ||
+    triggerMessage.guildId !== state.guildId ||
+    triggerMessage.channelId !== state.channelId
+  ) {
+    return;
+  }
+  if (state.inFlight) {
+    state.pendingMoveMessage = triggerMessage;
+    return;
+  }
+
+  state.inFlight = true;
+  try {
+    if (Date.now() >= state.phaseEndsAtMs) return;
+
+    const channel = await client.channels.fetch(state.channelId);
+    if (
+      !channel ||
+      !channel.isTextBased() ||
+      !("messages" in channel) ||
+      !("send" in channel)
+    ) {
+      throw new Error("The study timer channel is no longer available.");
+    }
+    const previousMessage = await channel.messages.fetch(state.messageId);
+    const card = await buildTimerCard(state, Date.now());
+    if (state.cancelled) return;
+
+    const replacement = await channel.send({
+      ...card,
+      flags: MessageFlags.IsComponentsV2,
+    });
+
+    let updated: { rows: Array<{ id: string }> };
+    try {
+      updated = await pool.query<{ id: string }>(
+        `UPDATE discord_study_timers
+         SET message_id = $2, updated_at = now()
+         WHERE id = $1 AND message_id = $3 AND status = 'running'
+         RETURNING id`,
+        [state.id, replacement.id, previousMessage.id],
+      );
+    } catch (error) {
+      await replacement.delete().catch((cleanupError: unknown) => {
+        logTimerError(
+          "study_timer_replacement_cleanup_failed",
+          cleanupError,
+          { timerId: state.id, messageId: replacement.id },
+        );
+      });
+      throw error;
+    }
+
+    if (!updated.rows[0]) {
+      await replacement.delete().catch((error: unknown) => {
+        logTimerError("study_timer_replacement_cleanup_failed", error, {
+          timerId: state.id,
+          messageId: replacement.id,
+        });
+      });
+      if (!state.cancelled) {
+        logTimerError(
+          "study_timer_reposition_conflict",
+          new Error("The active timer changed before its message could move."),
+          { timerId: state.id },
+        );
+      }
+      return;
+    }
+
+    state.messageId = replacement.id;
+    await previousMessage.delete().catch((error: unknown) => {
+      if (!isUnknownDiscordMessage(error)) {
+        logTimerError("study_timer_old_message_cleanup_failed", error, {
+          timerId: state.id,
+          messageId: previousMessage.id,
+        });
+      }
+    });
+    logTimerInfo("study_timer_repositioned", {
+      timerId: state.id,
+      channelId: state.channelId,
+      triggerMessageId: triggerMessage.id,
+      messageId: replacement.id,
+    });
+  } finally {
+    finishTimerOperation(client, pool, state);
   }
 }
 
