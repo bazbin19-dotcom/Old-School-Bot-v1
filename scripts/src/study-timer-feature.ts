@@ -244,6 +244,7 @@ function stateFromRow(row: StudyTimerRow): StudyTimerState {
     phaseEndsAtMs: row.phase_ends_at.getTime(),
     timeout: null,
     inFlight: false,
+    pendingMoveMessage: null,
     cancelled: false,
     retryDelayMs: 0,
   };
@@ -539,6 +540,7 @@ async function startTimer(
     phaseEndsAtMs: nowMs + studyDurationMs,
     timeout: null,
     inFlight: false,
+    pendingMoveMessage: null,
     cancelled: false,
     retryDelayMs: 0,
   };
@@ -642,24 +644,40 @@ async function stopTimer(
     return;
   }
 
-  await interaction.deferUpdate();
-  const stopped = await pool.query(
-    `UPDATE discord_study_timers
-     SET status = 'stopped', completed_at = now(), updated_at = now()
-     WHERE id = $1 AND status = 'running'
-     RETURNING id`,
-    [timerId],
-  );
-  clearTimerState(state);
-  try {
-    await interaction.message.delete();
-  } catch (error) {
-    if (!isUnknownDiscordMessage(error)) throw error;
+  if (state.inFlight) {
+    await interaction.reply({
+      content: "The timer is being updated. Please try again in a moment.",
+      flags: MessageFlags.Ephemeral,
+    });
+    return;
   }
-  logTimerInfo(stopped.rows[0] ? "study_timer_stopped" : "study_timer_already_ended", {
-    timerId,
-    userId: interaction.user.id,
-  });
+
+  state.inFlight = true;
+  try {
+    await interaction.deferUpdate();
+    const stopped = await pool.query(
+      `UPDATE discord_study_timers
+       SET status = 'stopped', completed_at = now(), updated_at = now()
+       WHERE id = $1 AND status = 'running'
+       RETURNING id`,
+      [timerId],
+    );
+    clearTimerState(state);
+    try {
+      await interaction.message.delete();
+    } catch (error) {
+      if (!isUnknownDiscordMessage(error)) throw error;
+    }
+    logTimerInfo(
+      stopped.rows[0] ? "study_timer_stopped" : "study_timer_already_ended",
+      {
+        timerId,
+        userId: interaction.user.id,
+      },
+    );
+  } finally {
+    finishTimerOperation(client, pool, state);
+  }
 }
 
 async function handleStudyTimerInteraction(
@@ -808,6 +826,33 @@ export function attachStudyTimerFeature(client: Client, pool: PgPool) {
   const onInteraction = (interaction: Interaction) => {
     void handleStudyTimerInteraction(client, pool, interaction);
   };
+  const onMessage = (message: Message) => {
+    if (
+      !message.inGuild() ||
+      message.author.bot ||
+      message.content.trim() !== "تعال"
+    ) {
+      return;
+    }
+
+    const matchingTimers = [...activeTimers.values()].filter(
+      (state) =>
+        !state.cancelled &&
+        state.guildId === message.guildId &&
+        state.channelId === message.channelId,
+    );
+    const state = matchingTimers[matchingTimers.length - 1];
+    if (!state) return;
+
+    void moveTimerBelowMessage(client, pool, state, message).catch(
+      (error: unknown) => {
+        logTimerError("study_timer_reposition_failed", error, {
+          timerId: state.id,
+          channelId: state.channelId,
+        });
+      },
+    );
+  };
   const onReady = (readyClient: Client<true>) => {
     void registerStudyTimerCommand(readyClient).catch((error: unknown) => {
       logTimerError("study_timer_command_registration_failed", error);
@@ -818,10 +863,12 @@ export function attachStudyTimerFeature(client: Client, pool: PgPool) {
   };
 
   client.on(Events.InteractionCreate, onInteraction);
+  client.on(Events.MessageCreate, onMessage);
   client.once(Events.ClientReady, onReady);
 
   return () => {
     client.off(Events.InteractionCreate, onInteraction);
+    client.off(Events.MessageCreate, onMessage);
     client.off(Events.ClientReady, onReady);
     for (const state of activeTimers.values()) {
       state.cancelled = true;
