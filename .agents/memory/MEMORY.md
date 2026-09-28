@@ -4,4 +4,4 @@
 - [Forest invite parsing](forest-invite-parsing.md) — tree names may appear in different positions; avoid relying on one fixed invite sentence pattern.
 - [Auction ephemeral feedback](auction-private-feedback.md) — use buttons/modals for private in-channel setup and rejection responses; publish only accepted bids and auction results.
 - [OpenType.js runtime quirks](opentype-esm.md) — use the default ESM export; serialize glyph paths directly because v2.0 can emit NaN.
-- [Discloud deployment packaging](discloud-deployment-packaging.md) — keep config at ZIP root and make install, build, and start commands compatible with npm-only builders.
+- [Discloud deployment packaging](discloud-deployment-packaging.md) — keep config at ZIP root and runtime binaries available to npm-only builders.
