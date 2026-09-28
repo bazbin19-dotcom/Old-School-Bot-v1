@@ -5,7 +5,7 @@
   "scripts": {
     "preinstall": "sh -c 'rm -f package-lock.json yarn.lock; case \"$npm_config_user_agent\" in pnpm/*|npm/*) ;; *) echo \"Use pnpm or npm\" >&2; exit 1 ;; esac'",
     "build": "if command -v pnpm >/dev/null 2>&1; then pnpm run typecheck && pnpm -r --if-present run build; else echo 'No separate build step is required'; fi",
-    "start": "npm run discord-bot --workspace=@workspace/scripts",
+    "start": "tsx scripts/src/discord-bot.ts",
     "typecheck:libs": "tsc --build",
     "typecheck": "pnpm run typecheck:libs && pnpm -r --filter \"./artifacts/**\" --filter \"./scripts\" --if-present run typecheck"
   },
@@ -15,7 +15,12 @@
   ],
   "private": true,
   "dependencies": {
-    "@replit/connectors-sdk": "^0.4.3"
+    "@replit/connectors-sdk": "^0.4.3",
+    "discord.js": "^14.27.0",
+    "opentype.js": "^2.0.0",
+    "pg": "^8.23.0",
+    "sharp": "^0.35.4",
+    "tsx": "^4.21.0"
   },
   "devDependencies": {
     "prettier": "^3.9.6",
